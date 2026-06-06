@@ -2721,15 +2721,25 @@ function screenProfileSelect(){
 }
 
 function selectProfile(id){
+ // Сохраняем текущий профиль перед переключением
+ if(ACTIVE && S.txns.length>0) persist();
+
  ACTIVE=id;
  localStorage.setItem(ACTIVE_KEY,id);
- // Reload state for this profile
+
+ // Полная перезагрузка state для нового профиля
  S.txns=ld('t',[]);S.budgets=ld('b',{});S.custom=ld('c',[]);
  S.goals=ld('g',[]);S.wallets=ld('w',DEF_WALLETS);S.templates=ld('tpl',[]);
  S.cur=ld('cur','THB');S.lang=ld('lang','en');
  S.sheetsUrl=ld('su','');S.sheetsSync=ld('ss',true);
  S.pin=ld('pin','');
+ S.storageClearDays=ld('storageDays',30);
+ S.lastPurge=ld('lastPurge',null);
  S.screen='home';S.pinLocked=!!S.pin;
+ S._storageAlert=null;
+
+ // Автобэкап при каждом переключении профиля
+ autoBackup();
  render();
 }
 
@@ -2787,6 +2797,84 @@ function showAddProfileSheet(){
  setTimeout(()=>nameInp.focus(),100);
 }
 
+// ════════════════════════════════════════
+// AUTO-BACKUP & DATA PROTECTION
+// ════════════════════════════════════════
+
+// Silent auto-backup to localStorage (rolling, keeps last 3)
+function autoBackup(){
+ if(!S.txns.length) return;
+ try{
+  const key=`fv2_backup_${ACTIVE||'main'}`;
+  const backup={
+   ts:new Date().toISOString(),
+   profile:ACTIVE,
+   txns:S.txns,
+   budgets:S.budgets,
+   custom:S.custom,
+   goals:S.goals,
+   wallets:S.wallets,
+   cur:S.cur,
+   lang:S.lang,
+  };
+  // Keep rolling backup (overwrite, 1 slot per profile)
+  localStorage.setItem(key, JSON.stringify(backup));
+ }catch(e){} // silent fail — don't interrupt user
+}
+
+// Restore from auto-backup if main data is empty
+function checkAndRestoreBackup(){
+ if(S.txns.length>0) return false; // data exists, no need
+ try{
+  const key=`fv2_backup_${ACTIVE||'main'}`;
+  const raw=localStorage.getItem(key);
+  if(!raw) return false;
+  const backup=JSON.parse(raw);
+  if(!backup.txns||!backup.txns.length) return false;
+
+  // Show restore prompt
+  const l=t();
+  const date=new Date(backup.ts).toLocaleDateString(l.loc||'en-US');
+  const ov=el('div',{style:{position:'fixed',inset:'0',zIndex:'9000',background:'rgba(0,0,0,.85)',display:'flex',alignItems:'flex-end',justifyContent:'center'}});
+  const box=el('div',{style:{background:'#1C1C28',borderRadius:'20px 20px 0 0',padding:'24px 20px 48px',width:'100%',maxWidth:'430px',border:'.5px solid rgba(255,149,0,.3)'}});
+  box.appendChild(el('div',{style:{textAlign:'center',fontSize:'36px',marginBottom:'12px'}},'⚠️'));
+  box.appendChild(el('div',{style:{fontSize:'18px',fontWeight:'700',textAlign:'center',marginBottom:'8px',color:'#FF9500'}},'Data Recovery'));
+  box.appendChild(el('div',{style:{fontSize:'14px',color:'rgba(255,255,255,.6)',textAlign:'center',marginBottom:'24px',lineHeight:'1.6'}}),);
+  box.children[2].textContent=`Found backup from ${date} with ${backup.txns.length} transactions. Restore it?`;
+  box.appendChild(el('button',{
+   style:{width:'100%',background:'#FF9500',border:'none',borderRadius:'12px',padding:'14px',color:'#fff',fontSize:'16px',fontWeight:'700',marginBottom:'10px'},
+   onClick:()=>{
+    S.txns=backup.txns;S.budgets=backup.budgets||{};
+    S.custom=backup.custom||[];S.goals=backup.goals||[];
+    S.wallets=backup.wallets||DEF_WALLETS;
+    S.cur=backup.cur||'THB';
+    persist();toast('Data restored ✓');ov.remove();render();
+   }
+  },'⚡ Restore Data'));
+  box.appendChild(el('button',{
+   style:{width:'100%',background:'none',border:'none',color:'rgba(255,255,255,.4)',fontSize:'14px',cursor:'pointer'},
+   onClick:()=>ov.remove()
+  },'Start fresh'));
+  ov.appendChild(box);document.body.appendChild(ov);
+  return true;
+ }catch{return false;}
+}
+
+// Auto-save when app goes to background (user switches apps)
+document.addEventListener('visibilitychange',()=>{
+ if(document.visibilityState==='hidden' && S.txns.length>0){
+  persist();
+  autoBackup();
+ }
+});
+
+// Auto-save every 2 minutes while app is open
+setInterval(()=>{
+ if(S.txns.length>0 && document.visibilityState==='visible'){
+  persist();
+ }
+},120000);
+
 function render(){
  const app=document.getElementById('app');app.innerHTML='';const l=t();
 
@@ -2802,6 +2890,9 @@ function render(){
   app.appendChild(screenProfileSelect());
   return;
  }
+
+ // Check if data was lost and offer restore
+ if(S.txns.length===0) setTimeout(()=>checkAndRestoreBackup(),500);
 
  // PIN lock
  if(S.pin&&S.pinLocked){
@@ -2849,9 +2940,10 @@ function render(){
 }
 
 if(S.pin) S.pinLocked=true;
-// Storage check: smart purge + warn if filling up
+// Auto-backup on startup
+if(S.txns.length>0) autoBackup();
+// Storage check
 startupStorageCheck().then(()=>render());
-// Initial render (before async check completes)
 render();
 </script>
 <script>
