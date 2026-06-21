@@ -1906,6 +1906,11 @@ function screenSettings(){
   el('button',{style:{flex:'1',background:'rgba(52,199,89,.15)',border:'.5px solid rgba(52,199,89,.3)',borderRadius:'10px',padding:'9px',color:'#34C759',fontSize:'13px',fontWeight:'600'},
    onClick:importFromSheets},'⬇️ '+(l.importSheets||'Import'))
  ));
+ // Sync all — дозалить весь локальный список в таблицу (бэклог). Дубли отсеет doPost.
+ shR.appendChild(el('div',{style:{display:'flex',marginTop:'8px'}},
+  el('button',{style:{flex:'1',background:'rgba(255,159,10,.15)',border:'.5px solid rgba(255,159,10,.3)',borderRadius:'10px',padding:'9px',color:'#FF9F0A',fontSize:'13px',fontWeight:'600'},
+   onClick:syncAllToSheets},'🔄 '+(l.syncAll||'Sync all'))
+ ));
  dc.appendChild(shR);
  dc.appendChild(el('div',{class:'sr',onClick:()=>{const now=new Date();generatePDF(now.getMonth(),now.getFullYear());}},
   el('div',{},el('div',{style:{fontWeight:'600',fontSize:'15px'}},'📄 Monthly PDF Report'),el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.4)'}},t().months[new Date().getMonth()]+' '+new Date().getFullYear())),
@@ -1967,6 +1972,25 @@ async function importFromSheets(){
  }catch(e){toast('Import failed — check Apps Script',true);}
 }
 
+// ── Push ALL local transactions to Sheets (backfill). doPost дедупит по содержимому ──
+async function syncAllToSheets(){
+ const l=t();
+ if(!S.sheetsUrl){toast(l.shNot,true);return;}
+ if(!S.txns.length){toast('No transactions',true);return;}
+ toast('Syncing '+S.txns.length+'...');
+ let sent=0;
+ // от старых к новым, чтобы порядок строк в таблице был хронологический
+ const list=[...S.txns].reverse();
+ for(const tx of list){
+  const{idemKey:_k,...txClean}=tx;
+  try{
+   await fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(txClean)});
+   sent++;
+  }catch(e){}
+  await new Promise(r=>setTimeout(r,200)); // не душим Apps Script
+ }
+ toast('✓ Sync all done ('+sent+')');
+}
 function expCSV(){const h=['date','type','amount','currency','category','wallet','note','tags'];const rows=S.txns.map(tx=>[tx.date,tx.type,tx.amount,tx.cur||'THB',tx.cat||tx.category||'',tx.walletId||'','"'+(tx.note||'').replace(/"/g,'""')+'"',tx.tags||'']);const csv=[h,...rows].map(r=>r.join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));a.download='finances.csv';a.click();toast('CSV ✓');}
 function backupJSON(){const d={txns:S.txns,budgets:S.budgets,custom:S.custom,goals:S.goals,wallets:S.wallets,templates:S.templates,cur:S.cur,lang:S.lang};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d,null,2)],{type:'application/json'}));a.download='finances-backup.json';a.click();toast('JSON ✓');}
 function restoreJSON(e){const l=t(),f=e.target.files?.[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{const d=JSON.parse(ev.target.result);if(d.txns)S.txns=d.txns;if(d.budgets)S.budgets=d.budgets;if(d.custom)S.custom=d.custom;if(d.goals)S.goals=d.goals;if(d.wallets)S.wallets=d.wallets;if(d.templates)S.templates=d.templates;if(d.cur)S.cur=d.cur;persist();toast(l.restOk);render();}catch{toast(l.restErr,true);}};r.readAsText(f);e.target.value='';}
