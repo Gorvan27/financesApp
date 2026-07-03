@@ -8,8 +8,8 @@
 <meta name="apple-mobile-web-app-title" content="Finances"/>
 <meta name="theme-color" content="#0A0A0F"/>
 <meta name="description" content="Personal Finance Tracker"/>
-<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230A0A0F'/><text y='.9em' font-size='72' x='14'>💰</text></svg>"/>
-<link rel="manifest" href="data:application/json,%7B%22name%22%3A%22My%20Finances%22%2C%22short_name%22%3A%22Finances%22%2C%22start_url%22%3A%22.%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%230A0A0F%22%2C%22theme_color%22%3A%22%230A0A0F%22%2C%22orientation%22%3A%22portrait%22%7D"/>
+<link rel="apple-touch-icon" href="icon-192.png"/>
+<link rel="manifest" href="manifest.json"/>
 <title>My Finances</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;touch-action:manipulation;}
@@ -162,7 +162,7 @@ function showStorageFullModal(context='photo'){
    S.lastPurge=new Date().toISOString();persist();
    modal.remove();
    _storageStatus.checked=0; // Force recheck
-   toast(l.photoClr||'Photos cleared ✓');
+   toast(t().photoClr||'Photos cleared ✓');
    render();
   }
  },'🗑 Clear All Photos Now'));
@@ -332,7 +332,7 @@ async function generatePDF(month,year){
  <div class="cards">
   <div class="card"><div style="color:#888;font-size:13px">INCOME</div><div class="card-v" style="color:#34C759">+${fm(totalInc,c.s)}</div></div>
   <div class="card"><div style="color:#888;font-size:13px">EXPENSES</div><div class="card-v" style="color:#FF3B30">−${fm(totalExp,c.s)}</div></div>
-  <div class="card"><div style="color:#888;font-size:13px">BALANCE</div><div class="card-v" style="color:${totalInc-totalExp>=0?'#007AFF':'#FF3B30'}">${totalInc-totalExp>=0?'+':''}${fm(totalInc-totalExp,c.s)}</div></div>
+  <div class="card"><div style="color:#888;font-size:13px">BALANCE</div><div class="card-v" style="color:${totalInc-totalExp>=0?'#007AFF':'#FF3B30'}">${totalInc-totalExp>=0?'+':'−'}${fm(totalInc-totalExp,c.s)}</div></div>
  </div>
  <h2 style="margin-bottom:16px">Top Categories</h2>
  <div style="margin-bottom:32px">${catRows||'<p style="color:#888">No expenses this month</p>'}</div>
@@ -945,6 +945,8 @@ let S={
  sheetsUrl:ld('fv2_su',''),
  sheetsSync:ld('fv2_ss',true),
  pin:     ld('fv2_pin',''),
+ tomb:    ld('fv2_tomb',[]),
+ outbox:  ld('fv2_outbox',[]),
  pinLocked: false,
  storageClearDays: ld('storageDays',30),
  lastPurge: ld('lastPurge',null),
@@ -953,6 +955,7 @@ let S={
  am:new Date().getMonth(),ay:new Date().getFullYear(),
  tp:'month',
  activeWallet:'all',
+ editId:null,
  form:{type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:'THB',walletId:'',receipt:null},
  nc:{label:'',emoji:'📦',type:'expense',desc:''},
  ng:{name:'',target:'',current:''},
@@ -977,6 +980,7 @@ function persist(){
  sv('fv2_g',S.goals);sv('fv2_w',S.wallets);sv('fv2_tpl',S.templates);
  sv('fv2_cur',S.cur);sv('fv2_lang',S.lang);sv('fv2_su',S.sheetsUrl);sv('fv2_ss',S.sheetsSync);
  sv('fv2_pin',S.pin);
+ sv('fv2_tomb',S.tomb);sv('fv2_outbox',S.outbox);
  sv('storageDays',S.storageClearDays);
  sv('lastPurge',S.lastPurge);
 }
@@ -1196,10 +1200,10 @@ function screenHome(){
  // ── TOTAL BALANCE CARD ──
  w.appendChild(el('div',{style:{margin:'0 16px 12px',background:'linear-gradient(135deg,#0A84FF,#005FCC)',borderRadius:'20px',padding:'18px 20px 16px'}},
   el('div',{style:{fontSize:'12px',color:'rgba(255,255,255,.7)',marginBottom:'2px'}},l.totalBal),
-  el('div',{style:{fontSize:'40px',fontWeight:'800',letterSpacing:'-1.5px',marginBottom:'4px'}},(totalBal>=0?'+':'')+fm(totalBal,c.s)),
+  el('div',{style:{fontSize:'40px',fontWeight:'800',letterSpacing:'-1.5px',marginBottom:'4px'}},(totalBal>=0?'+':'−')+fm(totalBal,c.s)),
   // This month sub-row
   el('div',{style:{fontSize:'12px',color:'rgba(255,255,255,.55)',marginBottom:'14px'}},
-   l.monthBal2+': '+(monthBal>=0?'+':'')+fm(monthBal,c.s)+
+   l.monthBal2+': '+(monthBal>=0?'+':'−')+fm(monthBal,c.s)+
    (delta!==null?' · '+(delta>0?'+':'')+delta+'% '+l.vsLast:'')
   ),
   el('div',{style:{display:'flex',background:'rgba(0,0,0,.2)',borderRadius:'12px',overflow:'hidden'}},
@@ -1239,6 +1243,7 @@ function screenHome(){
   tpls.forEach(tp=>{
    const cat=gc(tp.type,tp.cat);
    trow.appendChild(el('button',{class:'tchip',onClick:()=>{
+    S.editId=null;
     S.form={...S.form,type:tp.type,amt:tp.amt||'',cat:tp.cat,note:tp.name,date:td(),cur:tp.cur||S.cur,walletId:tp.walletId||''};
     S.screen='add';render();
    }},
@@ -1321,7 +1326,11 @@ function screenHistory(){
   row.appendChild(info);
   const right=el('div',{style:{textAlign:'right',flexShrink:'0'}});
   right.appendChild(el('div',{style:{fontWeight:'700',color:tx.type==='expense'?'#FF3B30':'#34C759',fontSize:'14px'}},(tx.type==='expense'?'−':'+')+fm(tx.amount,c.s)));
-  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();})},l.del);
+  right.appendChild(el('button',{style:{background:'none',border:'none',color:'rgba(0,122,255,.7)',fontSize:'11px',cursor:'pointer',padding:'3px 10px 3px 0'},onClick:()=>{
+   S.form={type:tx.type,amt:String(tx.amount),cat:tx.cat||tx.category,note:tx.note||'',tags:tx.tags||'',date:tx.date,cur:tx.cur||'THB',walletId:tx.walletId||'',receipt:null};
+   S.editId=tx.id;S.screen='add';render();
+  }},'✎'));
+  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{const k=tx.idemKey||(tx.type+'|'+tx.amount+'|'+(tx.cat||tx.category)+'|'+tx.date+'|'+(tx.cur||'THB'));S.tomb.unshift(k);if(S.tomb.length>500)S.tomb.length=500;if(tx.hasReceipt)deletePhoto(tx.id);S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();})},l.del);
   right.appendChild(delBtn);
   if(tx.hasReceipt||tx.receipt){
    const vBtn=el('button',{style:{background:'none',border:'none',color:'rgba(0,122,255,.8)',fontSize:'10px',cursor:'pointer',display:'block',padding:'2px 0'},
@@ -1358,39 +1367,42 @@ function screenAnalytics(){
  const at=filterTxns(S.am,S.ay,S.cur,wid);
  const aExp=sum(at,'expense'),aInc=sum(at,'income');
  const now=new Date(),tm=now.getMonth(),ty=now.getFullYear();
+ // якорь тренда: выбранный месяц (для текущего — сегодня, для прошлых — конец месяца)
+ const aM=S.am,aY=S.ay;
+ const anchor=(aY===ty&&aM===tm)?new Date(ty,tm,now.getDate()):new Date(aY,aM+1,0);
  const curTxns=S.txns.filter(tx=>(tx.cur||'THB')===S.cur&&tx.type==='expense'&&(!wid||(tx.walletId||'')===wid));
 
  // Trend points
  let pts=[];
  if(S.tp==='day'){
   // last 14 days
-  const today=new Date(ty,tm,now.getDate());
+  const today=new Date(anchor);
   pts=Array.from({length:14},(_,i)=>{
    const d=new Date(today);d.setDate(d.getDate()-(13-i));
    const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
    return{l:String(d.getDate()),v:curTxns.filter(tx=>tx.date===k).reduce((s,tx)=>s+tx.amount,0)};
   });
  } else if(S.tp==='week'){
-  const today=new Date(ty,tm,now.getDate());
+  const today=new Date(anchor);
   pts=Array.from({length:7},(_,i)=>{
    const d=new Date(today);d.setDate(d.getDate()-(6-i));
    const k=d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
    return{l:['Su','Mo','Tu','We','Th','Fr','Sa'][d.getDay()],v:curTxns.filter(tx=>tx.date===k).reduce((s,tx)=>s+tx.amount,0)};
   });
  } else if(S.tp==='month'){
-  const days=new Date(ty,tm+1,0).getDate();
+  const days=new Date(aY,aM+1,0).getDate();
   pts=Array.from({length:days},(_,i)=>{
-   const day=i+1,k=ty+'-'+String(tm+1).padStart(2,'0')+'-'+String(day).padStart(2,'0');
+   const day=i+1,k=aY+'-'+String(aM+1).padStart(2,'0')+'-'+String(day).padStart(2,'0');
    return{l:day%5===1||day===days?String(day):'',v:curTxns.filter(tx=>tx.date===k).reduce((s,tx)=>s+tx.amount,0)};
   });
  } else if(S.tp==='6m'){
   pts=Array.from({length:6},(_,i)=>{
-   const d=new Date(ty,tm-(5-i),1),m=d.getMonth(),y=d.getFullYear();
+   const d=new Date(aY,aM-(5-i),1),m=d.getMonth(),y=d.getFullYear();
    return{l:l.ms[m],v:curTxns.filter(tx=>{const td2=pd(tx.date);return td2.getMonth()===m&&td2.getFullYear()===y;}).reduce((s,tx)=>s+tx.amount,0)};
   });
  } else {
   pts=Array.from({length:12},(_,i)=>{
-   const d=new Date(ty,tm-(11-i),1),m=d.getMonth(),y=d.getFullYear();
+   const d=new Date(aY,aM-(11-i),1),m=d.getMonth(),y=d.getFullYear();
    return{l:l.ms[m],v:curTxns.filter(tx=>{const td2=pd(tx.date);return td2.getMonth()===m&&td2.getFullYear()===y;}).reduce((s,tx)=>s+tx.amount,0)};
   });
  }
@@ -1952,17 +1964,19 @@ async function importFromSheets(){
    toast('Update Apps Script — add doGet function',true);return;
   }
   const existing=new Set(S.txns.map(tx=>tx.idemKey||`${tx.type}|${tx.amount}|${tx.cat}|${tx.date}|${tx.cur}`));
+  const tomb=new Set(S.tomb||[]);
   const cutoff=new Date(Date.now()-14*86400000);
   let imported=0;
   data.rows.forEach(row=>{
-   const date=row[0],type=row[1],amount=parseFloat(row[2]);
+   const date=String(row[0]).slice(0,10),type=row[1],amount=parseFloat(row[2]);
    if(!date||!type||isNaN(amount))return;
    if(new Date(date)<cutoff)return;
-   const cur=row[3]||'THB',cat=row[4]||'other',note=row[6]||'';
+   const cur=row[3]||'THB',cat=row[4]||'other',note=row[5]||'',tags=row[6]||'';
    if(note==='__connection_test__')return;
    const idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;
    if(existing.has(idemKey))return;
-   S.txns.unshift({id:mid(),type,amount,cat,note,tags:'',date,cur,walletId:'',hasReceipt:false,createdAt:new Date().toISOString(),idemKey});
+   if(tomb.has(idemKey))return;
+   S.txns.unshift({id:mid(),type,amount,cat,note,tags,date,cur,walletId:'',hasReceipt:false,createdAt:new Date().toISOString(),idemKey});
    existing.add(idemKey);imported++;
   });
   S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
@@ -2099,7 +2113,7 @@ function screenAdd(){
 
  // Header
  w.appendChild(el('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'54px 16px 10px',background:'#0A0A0F'}},
-  el('button',{style:{background:'rgba(255,255,255,.08)',border:'none',borderRadius:'50%',width:'34px',height:'34px',color:'rgba(255,255,255,.7)',fontSize:'17px',display:'flex',alignItems:'center',justifyContent:'center'},onClick:()=>{S.screen='home';render();}},'✕'),
+  el('button',{style:{background:'rgba(255,255,255,.08)',border:'none',borderRadius:'50%',width:'34px',height:'34px',color:'rgba(255,255,255,.7)',fontSize:'17px',display:'flex',alignItems:'center',justifyContent:'center'},onClick:()=>{S.editId=null;S.screen='home';render();}},'✕'),
   el('div',{style:{fontSize:'17px',fontWeight:'700',color:'#fff'}},l.newRec),
   el('button',{style:{background:'#007AFF',border:'none',borderRadius:'16px',padding:'6px 16px',color:'#fff',fontSize:'14px',fontWeight:'600'},onClick:addTxn},l.done)
  ));
@@ -2209,6 +2223,24 @@ function screenAdd(){
  return w;
 }
 
+// ── OUTBOX: очередь доставки в Sheets (переживает офлайн/закрытие) ──
+let _obFlushing=false;
+async function flushOutbox(){
+ if(_obFlushing||!S.sheetsUrl||!S.sheetsSync||!S.outbox.length)return;
+ _obFlushing=true;
+ try{
+  while(S.outbox.length){
+   const item=S.outbox[0];
+   try{
+    await fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(item)});
+    S.outbox.shift();sv('fv2_outbox',S.outbox);
+   }catch(e){break;} // офлайн — повторим при online/старте
+   if(S.outbox.length)await new Promise(r=>setTimeout(r,200));
+  }
+ }finally{_obFlushing=false;}
+}
+window.addEventListener('online',()=>flushOutbox());
+
 let _txnSaving=false;
 
 function addTxn(){
@@ -2216,6 +2248,25 @@ function addTxn(){
  const l=t(),f=S.form;
  if(!f.amt||isNaN(+f.amt)||+f.amt<=0){toast(l.entAmt,true);return;}
  if(!f.cat){toast(l.selCat,true);return;}
+
+ // ── EDIT MODE ──
+ if(S.editId){
+  const old=S.txns.find(x=>x.id===S.editId);
+  if(old){
+   const oldKey=old.idemKey||(old.type+'|'+old.amount+'|'+(old.cat||old.category)+'|'+old.date+'|'+(old.cur||'THB'));
+   const newKey=`${f.type}|${f.amt}|${f.cat}|${f.date||td()}|${f.cur||S.cur}`;
+   if(oldKey!==newKey){S.tomb.unshift(oldKey);if(S.tomb.length>500)S.tomb.length=500;}
+   Object.assign(old,{type:f.type,amount:+f.amt,cat:f.cat,note:f.note,tags:f.tags,date:f.date||td(),cur:f.cur||S.cur,walletId:f.walletId||'',idemKey:newKey});
+   if(f.receipt){savePhoto(old.id,f.receipt).catch(()=>{});old.hasReceipt=true;}
+   S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
+   S.editId=null;
+   S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};
+   persist();toast(l.saved);S.screen='history';render();
+   if(S.sheetsUrl&&S.sheetsSync){const{idemKey:_k,...txClean}=old;S.outbox.push(txClean);sv('fv2_outbox',S.outbox);flushOutbox();}
+   return;
+  }
+  S.editId=null;
+ }
 
  const idemKey=`${f.type}|${f.amt}|${f.cat}|${f.date||td()}|${f.cur||S.cur}`;
  const isDuplicate=S.txns.slice(0,5).some(tx=>tx.idemKey===idemKey&&(Date.now()-new Date(tx.createdAt).getTime())<3000);
@@ -2249,7 +2300,8 @@ function addTxn(){
 
  if(S.sheetsUrl&&S.sheetsSync){
   const{idemKey:_k,...txClean}=tx;
-  fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(txClean)}).catch(()=>{});
+  S.outbox.push(txClean);sv('fv2_outbox',S.outbox);
+  flushOutbox();
  }
 }
 
@@ -2801,11 +2853,11 @@ function selectProfile(id){
  localStorage.setItem(ACTIVE_KEY,id);
 
  // Полная перезагрузка state для нового профиля
- S.txns=ld('t',[]);S.budgets=ld('b',{});S.custom=ld('c',[]);
- S.goals=ld('g',[]);S.wallets=ld('w',DEF_WALLETS);S.templates=ld('tpl',[]);
- S.cur=ld('cur','THB');S.lang=ld('lang','en');
- S.sheetsUrl=ld('su','');S.sheetsSync=ld('ss',true);
- S.pin=ld('pin','');
+ S.txns=ld('fv2_t',ld('t',[]));S.budgets=ld('fv2_b',ld('b',{}));S.custom=ld('fv2_c',ld('c',[]));
+ S.goals=ld('fv2_g',ld('g',[]));S.wallets=ld('fv2_w',ld('w',DEF_WALLETS));S.templates=ld('fv2_tpl',ld('tpl',[]));
+ S.cur=ld('fv2_cur',ld('cur','THB'));S.lang=ld('fv2_lang',ld('lang','en'));
+ S.sheetsUrl=ld('fv2_su',ld('su',''));S.sheetsSync=ld('fv2_ss',ld('ss',true));
+ S.pin=ld('fv2_pin',ld('pin',''));S.tomb=ld('fv2_tomb',[]);S.outbox=ld('fv2_outbox',[]);
  S.storageClearDays=ld('storageDays',30);
  S.lastPurge=ld('lastPurge',null);
  S.screen='home';S.pinLocked=!!S.pin;
@@ -2900,6 +2952,7 @@ function autoBackup(){
 // Restore from auto-backup if main data is empty
 function checkAndRestoreBackup(){
  if(S.txns.length>0) return false; // data exists, no need
+ if(sessionStorage.getItem('skip_restore_'+(ACTIVE||'main'))) return false; // user chose Start fresh
  try{
   const key=`fv2_backup_${ACTIVE||'main'}`;
   const raw=localStorage.getItem(key);
@@ -2930,7 +2983,7 @@ function checkAndRestoreBackup(){
   },'⚡ Restore Data'));
   box.appendChild(el('button',{
    style:{width:'100%',background:'none',border:'none',color:'rgba(255,255,255,.4)',fontSize:'14px',cursor:'pointer'},
-   onClick:()=>ov.remove()
+   onClick:()=>{sessionStorage.setItem('skip_restore_'+(ACTIVE||'main'),'1');ov.remove();}
   },'Start fresh'));
   ov.appendChild(box);document.body.appendChild(ov);
   return true;
@@ -3003,7 +3056,7 @@ function render(){
  app.appendChild((map[S.screen]||screenHome)());
  const noFab=new Set(['add','addCat','addWallet','addTemplate','manageCats']);
  if(!noFab.has(S.screen)){
-  app.appendChild(el('button',{class:'fab',onClick:()=>{S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};S.screen='add';render();}},'+'));
+  app.appendChild(el('button',{class:'fab',onClick:()=>{S.editId=null;S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};S.screen='add';render();}},'+'));
  }
  const nav=el('nav',{class:'nb'});
  const noNav=new Set(['add','addCat','addWallet','addTemplate','manageCats']);
@@ -3021,55 +3074,15 @@ if(S.pin) S.pinLocked=true;
 if(S.txns.length>0) autoBackup();
 // Storage check
 startupStorageCheck().then(()=>render());
+setTimeout(()=>flushOutbox(),1500);
 render();
 </script>
 <script>
-// Service Worker с версионированием — при обновлении файла кэш сбрасывается автоматически
-if('serviceWorker' in navigator){
-  const CACHE_VERSION='finances-v4-20260513'; // Меняй при каждом деплое
-  const swCode=`
-const CACHE='${`finances-v4-20260513`}';
-const FILE=location.pathname;
-
-self.addEventListener('install',e=>{
-  e.waitUntil(
-    caches.open(CACHE).then(c=>c.add(FILE)).catch(()=>{})
-  );
-  self.skipWaiting();
-});
-
-self.addEventListener('activate',e=>{
-  // Удаляем все старые версии кэша
-  e.waitUntil(
-    caches.keys().then(keys=>Promise.all(
-      keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))
-    )).then(()=>clients.claim())
-  );
-});
-
-self.addEventListener('fetch',e=>{
-  // Network-first: всегда пробуем сеть, кэш только при офлайне
-  e.respondWith(
-    fetch(e.request).then(res=>{
-      if(res.ok){
-        const clone=res.clone();
-        caches.open(CACHE).then(c=>c.put(e.request,clone));
-      }
-      return res;
-    }).catch(()=>caches.match(e.request).then(r=>r||caches.match(FILE)))
-  );
-});
-`;
-  try{
-    const blob=new Blob([swCode],{type:'application/javascript'});
-    const url=URL.createObjectURL(blob);
-    navigator.serviceWorker.register(url,{scope:'./'})
-      .then(reg=>{
-        // Принудительно проверяем обновление при каждом открытии
-        reg.update();
-      })
-      .catch(()=>{});
-  }catch(e){}
+// SW из файла (blob-URL браузеры не регистрируют). Версия кэша — внутри sw.js.
+if('serviceWorker' in navigator&&(location.protocol==='https:'||location.hostname==='localhost')){
+  navigator.serviceWorker.register('./sw.js',{scope:'./'})
+    .then(reg=>reg.update())
+    .catch(()=>{});
 }
 </script>
 </body>
