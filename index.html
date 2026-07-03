@@ -1330,14 +1330,15 @@ function screenHistory(){
    S.form={type:tx.type,amt:String(tx.amount),cat:tx.cat||tx.category,note:tx.note||'',tags:tx.tags||'',date:tx.date,cur:tx.cur||'THB',walletId:tx.walletId||'',receipt:null};
    S.editId=tx.id;S.screen='add';render();
   }},'✎'));
-  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{const k=tx.idemKey||(tx.type+'|'+tx.amount+'|'+(tx.cat||tx.category)+'|'+tx.date+'|'+(tx.cur||'THB'));S.tomb.unshift(k);if(S.tomb.length>500)S.tomb.length=500;if(tx.hasReceipt)deletePhoto(tx.id);S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();})},l.del);
+  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{const k=tx.idemKey||(tx.type+'|'+tx.amount+'|'+(tx.cat||tx.category)+'|'+tx.date+'|'+(tx.cur||'THB'));S.tomb.unshift(k);if(S.tomb.length>500)S.tomb.length=500;if(tx.hasReceipt)deletePhoto(tx.id);if(S.sheetsUrl&&S.sheetsSync)S.outbox.push({action:'delete',id:tx.id,sig:[tx.date,tx.type,tx.amount,tx.cur||'THB',tx.note||''].join('|')});S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();flushOutbox();})},l.del);
   right.appendChild(delBtn);
-  if(tx.hasReceipt||tx.receipt){
+  if(tx.hasReceipt||tx.receipt||tx.photoUrl){
    const vBtn=el('button',{style:{background:'none',border:'none',color:'rgba(0,122,255,.8)',fontSize:'10px',cursor:'pointer',display:'block',padding:'2px 0'},
     onClick:async()=>{
      let photo=tx.receipt||null; // backward compat inline
      if(!photo&&tx.hasReceipt)photo=await getPhoto(tx.id);
      if(photo)showReceipt(photo);
+     else if(tx.photoUrl)window.open(tx.photoUrl,'_blank');
      else toast('Photo not found',true);
     }
    },'📷 '+l.viewReceipt);
@@ -1947,46 +1948,72 @@ function testSheets(){
  const l=t();
  if(!S.sheetsUrl){toast(l.shNot,true);return;}
  toast('Testing...');
- fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({date:td(),type:'expense',amount:0,cat:'test',note:'__connection_test__',cur:S.cur})
- }).then(()=>toast(l.shOk)).catch(()=>toast(l.shErr,true));
+ sheetsPost({action:'ping'}).then(r=>{
+  if(r&&r.ok)toast(l.shOk+(r.v?' (v'+r.v+')':''));
+  else toast(l.shErr,true); // теперь честно: ответ реально читается
+ });
 }
 
-// ── Import transactions from Google Sheets (last 2 weeks) ──
-async function importFromSheets(){
+// ── SYNC v2: полный двухсторонний reconcile с Google Sheets ──
+async function importFromSheets(silent){
  const l=t();
- if(!S.sheetsUrl){toast(l.shNot,true);return;}
- toast('Loading from Sheets...');
+ if(!S.sheetsUrl){if(!silent)toast(l.shNot,true);return;}
+ if(!silent)toast('Syncing with Sheets...');
  try{
   const res=await fetch(S.sheetsUrl,{method:'GET'});
   const data=await res.json();
   if(!data||!Array.isArray(data.rows)){
-   toast('Update Apps Script — add doGet function',true);return;
+   if(!silent)toast('Update Apps Script — add doGet function',true);return;
   }
-  const existing=new Set(S.txns.map(tx=>tx.idemKey||`${tx.type}|${tx.amount}|${tx.cat}|${tx.date}|${tx.cur}`));
+  const v2=data.v>=2;
   const tomb=new Set(S.tomb||[]);
-  const cutoff=new Date(Date.now()-14*86400000);
-  let imported=0;
+  const byId=new Map(S.txns.filter(x=>x.id).map(x=>[String(x.id),x]));
+  const existing=new Set(S.txns.map(tx=>tx.idemKey||`${tx.type}|${tx.amount}|${tx.cat}|${tx.date}|${tx.cur}`));
+  const sheetIds=new Set();
+  let imported=0,removed=0;
   data.rows.forEach(row=>{
    const date=String(row[0]).slice(0,10),type=row[1],amount=parseFloat(row[2]);
    if(!date||!type||isNaN(amount))return;
-   if(new Date(date)<cutoff)return;
    const cur=row[3]||'THB',cat=row[4]||'other',note=row[5]||'',tags=row[6]||'';
    if(note==='__connection_test__')return;
+   const rid=v2?String(row[9]||''):'',status=v2?String(row[10]||''):'',photoUrl=v2?String(row[11]||''):'';
+   if(rid&&status!=='deleted')sheetIds.add(rid);
+   // удалено в таблице → зеркалим локально
+   if(status==='deleted'){
+    if(rid&&byId.has(rid)){
+     const tx0=byId.get(rid);
+     if(tx0.hasReceipt)deletePhoto(tx0.id);
+     S.txns=S.txns.filter(x=>String(x.id)!==rid);byId.delete(rid);removed++;
+    }
+    return;
+   }
+   // уже есть локально → отметить синк, подтянуть фото-ссылку
+   if(rid&&byId.has(rid)){
+    const tx0=byId.get(rid);tx0.synced=true;
+    if(photoUrl&&!tx0.photoUrl)tx0.photoUrl=photoUrl;
+    return;
+   }
    const idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;
    if(existing.has(idemKey))return;
    if(tomb.has(idemKey))return;
-   S.txns.unshift({id:mid(),type,amount,cat,note,tags,date,cur,walletId:'',hasReceipt:false,createdAt:new Date().toISOString(),idemKey});
+   S.txns.unshift({id:rid||mid(),type,amount,cat,note,tags,date,cur,walletId:'',hasReceipt:false,photoUrl:photoUrl||'',createdAt:new Date().toISOString(),idemKey,synced:true});
    existing.add(idemKey);imported++;
   });
+  // физически стёртые из таблицы строки → удалить локально (только синканные, и не ждущие в outbox)
+  if(v2){
+   const pend=new Set(S.outbox.map(o=>(o.tx&&o.tx.id)||o.id).filter(Boolean));
+   const before=S.txns.length;
+   S.txns=S.txns.filter(tx=>!(tx.id&&tx.synced&&!sheetIds.has(String(tx.id))&&!pend.has(tx.id)));
+   removed+=before-S.txns.length;
+  }
   S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
   persist();autoBackup();
-  if(imported>0){toast(`✓ Imported ${imported} transactions`);render();}
-  else toast('All data up to date ✓');
- }catch(e){toast('Import failed — check Apps Script',true);}
+  if(imported>0||removed>0){toast(`Sheets ✓ +${imported}${removed?' / −'+removed:''}`);render();}
+  else if(!silent)toast('All data up to date ✓');
+ }catch(e){if(!silent)toast('Import failed — check Apps Script',true);}
 }
 
-// ── Push ALL local transactions to Sheets (backfill). doPost дедупит по содержимому ──
+// ── Push ALL local transactions to Sheets (backfill + фото). Дедуп на сервере ──
 async function syncAllToSheets(){
  const l=t();
  if(!S.sheetsUrl){toast(l.shNot,true);return;}
@@ -1996,14 +2023,19 @@ async function syncAllToSheets(){
  // от старых к новым, чтобы порядок строк в таблице был хронологический
  const list=[...S.txns].reverse();
  for(const tx of list){
-  const{idemKey:_k,...txClean}=tx;
-  try{
-   await fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(txClean)});
-   sent++;
-  }catch(e){}
-  await new Promise(r=>setTimeout(r,200)); // не душим Apps Script
+  const{idemKey:_k,synced:_s,...txClean}=tx;
+  // бэкфилл фото: локальное фото ещё не в Drive → шлём update с base64
+  let action='add';
+  if(tx.hasReceipt&&!tx.photoUrl){
+   const ph=await getPhoto(tx.id);
+   if(ph){txClean.photo=ph;action='update';}
+  }
+  const r=await sheetsPost({action,tx:txClean});
+  if(r&&r.ok){tx.synced=true;if(r.photoUrl)tx.photoUrl=r.photoUrl;sent++;}
+  await new Promise(r2=>setTimeout(r2,200)); // не душим Apps Script
  }
- toast('✓ Sync all done ('+sent+')');
+ persist();
+ toast('✓ Sync all done ('+sent+'/'+S.txns.length+')');
 }
 function expCSV(){const h=['date','type','amount','currency','category','wallet','note','tags'];const rows=S.txns.map(tx=>[tx.date,tx.type,tx.amount,tx.cur||'THB',tx.cat||tx.category||'',tx.walletId||'','"'+(tx.note||'').replace(/"/g,'""')+'"',tx.tags||'']);const csv=[h,...rows].map(r=>r.join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['\uFEFF'+csv],{type:'text/csv;charset=utf-8'}));a.download='finances.csv';a.click();toast('CSV ✓');}
 function backupJSON(){const d={txns:S.txns,budgets:S.budgets,custom:S.custom,goals:S.goals,wallets:S.wallets,templates:S.templates,cur:S.cur,lang:S.lang};const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(d,null,2)],{type:'application/json'}));a.download='finances-backup.json';a.click();toast('JSON ✓');}
@@ -2223,6 +2255,14 @@ function screenAdd(){
  return w;
 }
 
+// ── SYNC v2: POST c читаемым ответом (text/plain = simple request, без preflight) ──
+async function sheetsPost(obj){
+ try{
+  const res=await fetch(S.sheetsUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(obj)});
+  return await res.json();
+ }catch(e){return null;} // офлайн / сеть / не-JSON
+}
+
 // ── OUTBOX: очередь доставки в Sheets (переживает офлайн/закрытие) ──
 let _obFlushing=false;
 async function flushOutbox(){
@@ -2230,12 +2270,17 @@ async function flushOutbox(){
  _obFlushing=true;
  try{
   while(S.outbox.length){
-   const item=S.outbox[0];
-   try{
-    await fetch(S.sheetsUrl,{method:'POST',mode:'no-cors',headers:{'Content-Type':'application/json'},body:JSON.stringify(item)});
-    S.outbox.shift();sv('fv2_outbox',S.outbox);
-   }catch(e){break;} // офлайн — повторим при online/старте
-   if(S.outbox.length)await new Promise(r=>setTimeout(r,200));
+   let item=S.outbox[0];
+   if(!item.action)item={action:'add',tx:item}; // старый формат очереди
+   const r=await sheetsPost(item);
+   if(r===null)break; // офлайн — повторим при online/старте
+   if(r.ok){
+    const id=item.tx&&item.tx.id;
+    if(id){const tx0=S.txns.find(x=>x.id===id);if(tx0){tx0.synced=true;if(r.photoUrl)tx0.photoUrl=r.photoUrl;}}
+    persist();
+   }
+   S.outbox.shift();sv('fv2_outbox',S.outbox); // ok или отвергнуто сервером — из очереди убираем
+   if(S.outbox.length)await new Promise(r2=>setTimeout(r2,200));
   }
  }finally{_obFlushing=false;}
 }
@@ -2262,7 +2307,7 @@ function addTxn(){
    S.editId=null;
    S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};
    persist();toast(l.saved);S.screen='history';render();
-   if(S.sheetsUrl&&S.sheetsSync){const{idemKey:_k,...txClean}=old;S.outbox.push(txClean);sv('fv2_outbox',S.outbox);flushOutbox();}
+   if(S.sheetsUrl&&S.sheetsSync){const{idemKey:_k,...txClean}=old;if(f.receipt)txClean.photo=f.receipt;old.synced=false;S.outbox.push({action:'update',tx:txClean});sv('fv2_outbox',S.outbox);flushOutbox();}
    return;
   }
   S.editId=null;
@@ -2300,7 +2345,8 @@ function addTxn(){
 
  if(S.sheetsUrl&&S.sheetsSync){
   const{idemKey:_k,...txClean}=tx;
-  S.outbox.push(txClean);sv('fv2_outbox',S.outbox);
+  if(hasReceipt&&f.receipt)txClean.photo=f.receipt;
+  S.outbox.push({action:'add',tx:txClean});sv('fv2_outbox',S.outbox);
   flushOutbox();
  }
 }
@@ -3075,6 +3121,7 @@ if(S.txns.length>0) autoBackup();
 // Storage check
 startupStorageCheck().then(()=>render());
 setTimeout(()=>flushOutbox(),1500);
+setTimeout(()=>{if(S.sheetsUrl&&S.sheetsSync&&navigator.onLine)importFromSheets(true);},4000);
 render();
 </script>
 <script>
