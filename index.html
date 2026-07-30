@@ -105,12 +105,53 @@ function ld(k,d){try{const v=localStorage.getItem(pfx(k));return v?JSON.parse(v)
 function sv(k,v){
  try{
   localStorage.setItem(pfx(k),JSON.stringify(v));
+  return true;
  }catch(e){
   if(e.name==='QuotaExceededError'||e.code===22){
-   // Storage full — show emergency modal
+   // localStorage (~5MB on iOS) is full — this is NOT device storage.
+   // Try to reclaim space automatically before bothering the user.
+   if(reclaimLocalStorage()){
+    try{localStorage.setItem(pfx(k),JSON.stringify(v));return true;}catch(e2){}
+   }
    showStorageFullModal('data');
   }
+  return false;
  }
+}
+
+// Strip base64 payloads out of a sync queue — photos live in IndexedDB,
+// the queue only needs a reference. Returns [queue, changed].
+function stripOutboxPhotos(q){
+ let changed=false;
+ const out=(q||[]).map(it=>{
+  if(it&&it.tx&&it.tx.photo){
+   changed=true;
+   const{photo,...rest}=it.tx;
+   return{...it,tx:{...rest,photoRef:rest.id}};
+  }
+  return it;
+ });
+ return[out,changed];
+}
+
+// Reclaim localStorage. Order matters: drop redundant data first,
+// never touch fv2_t (the transactions themselves).
+function reclaimLocalStorage(){
+ try{
+  const raw=localStorage.getItem(pfx('fv2_outbox'));
+  if(raw&&raw.indexOf('"photo"')>=0){
+   const[q]=stripOutboxPhotos(JSON.parse(raw));
+   localStorage.setItem(pfx('fv2_outbox'),JSON.stringify(q));
+   if(typeof S!=='undefined'&&S)S.outbox=q;
+   return true;
+  }
+ }catch(e){}
+ try{
+  // Rolling auto-backup is a duplicate of fv2_t — safe to drop under pressure
+  const bk=`fv2_backup_${ACTIVE||'main'}`;
+  if(localStorage.getItem(bk)){localStorage.removeItem(bk);return true;}
+ }catch(e){}
+ return false;
 }
 
 // Request persistent storage — makes data survive like native app
@@ -145,27 +186,47 @@ function showStorageFullModal(context='photo'){
  // Dynamic message
  const msg=context==='photo'
   ?'Cannot save receipt photo.\nYour transaction was saved.\n\nFree up space to continue using photos.'
-  :'Cannot save transaction!\n\nFree up space immediately\nto prevent data loss.';
+  :'App data storage is full.\nYour last change may not be saved.\n\nThis is separate from device storage —\nclearing photos will not help.';
  box.children[2].textContent=msg;
 
- // Action 1: Clear photos now
- box.appendChild(el('button',{
-  style:{width:'100%',background:'#FF3B30',border:'none',borderRadius:'14px',padding:'16px',color:'#fff',fontSize:'16px',fontWeight:'700',marginBottom:'12px',cursor:'pointer'},
-  onClick:async()=>{
-   if(_photoDB){
-    await new Promise(res=>{
-     const tx=_photoDB.transaction('photos','readwrite');
-     tx.objectStore('photos').clear();
-     tx.oncomplete=res;
-    });
+ // Action 1 — remedy depends on WHICH storage is full.
+ // 'photo'  → IndexedDB (receipt photos)
+ // 'data'   → localStorage (~5MB): sync queue + auto-backup are the only
+ //            expendable things in there. Photos live elsewhere.
+ if(context==='photo'){
+  box.appendChild(el('button',{
+   style:{width:'100%',background:'#FF3B30',border:'none',borderRadius:'14px',padding:'16px',color:'#fff',fontSize:'16px',fontWeight:'700',marginBottom:'12px',cursor:'pointer'},
+   onClick:async()=>{
+    if(_photoDB){
+     await new Promise(res=>{
+      const tx=_photoDB.transaction('photos','readwrite');
+      tx.objectStore('photos').clear();
+      tx.oncomplete=res;
+     });
+    }
+    S.lastPurge=new Date().toISOString();persist();
+    modal.remove();
+    _storageStatus.checked=0; // Force recheck
+    toast(t().photoClr||'Photos cleared ✓');
+    render();
    }
-   S.lastPurge=new Date().toISOString();persist();
-   modal.remove();
-   _storageStatus.checked=0; // Force recheck
-   toast(t().photoClr||'Photos cleared ✓');
-   render();
-  }
- },'🗑 Clear All Photos Now'));
+  },'🗑 Clear All Photos Now'));
+ } else {
+  box.appendChild(el('button',{
+   style:{width:'100%',background:'#FF3B30',border:'none',borderRadius:'14px',padding:'16px',color:'#fff',fontSize:'16px',fontWeight:'700',marginBottom:'12px',cursor:'pointer'},
+   onClick:()=>{
+    // Drop the pending sync queue and the rolling backup, then retry the write.
+    try{localStorage.removeItem(pfx('fv2_outbox'));}catch(e){}
+    try{localStorage.removeItem(`fv2_backup_${ACTIVE||'main'}`);}catch(e){}
+    S.outbox=[];
+    modal.remove();
+    const ok=sv('fv2_t',S.txns);
+    if(ok){persist();toast('Space freed ✓');}
+    else toast('Still full — export a backup',true);
+    render();
+   }
+  },'🧹 Clear Sync Queue & Backup'));
+ }
 
  // Action 2: Download backup
  box.appendChild(el('button',{
@@ -415,6 +476,7 @@ en:{flag:'🇬🇧',name:'English',loc:'en-US',
  createPrf:'Create Profile',prsTitle:'Personal finances',
  switchPrf:'Switch',activePrf:'Active',
  allWallets:'All',curLabel:'current',todayLbl:'→ today',builtIn:'built-in',
+ fltAllCats:'All',fltCustom:'Custom range',fltReset:'Reset',fltApply:'Apply',fltFrom:'From',fltTo:'To',fltPeriod:'Period',sumTotal:'Total',sumCount:'Records',sumAvg:'Average',sumShare:'Of all expenses',
  months:['January','February','March','April','May','June','July','August','September','October','November','December'],
  ms:['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'],
  cats:{food:'Food',transport:'Transport',entertainment:'Entertainment',health:'Health',shopping:'Shopping',housing:'Housing',other:'Other',salary:'Salary',freelance:'Freelance',gift:'Gift',investment:'Investment'},
@@ -476,6 +538,7 @@ ru:{flag:'🇷🇺',name:'Русский',loc:'ru-RU',
  createPrf:'Создать профиль',prsTitle:'Личные финансы',
  switchPrf:'Сменить',activePrf:'Активный',
  allWallets:'Все',curLabel:'сейчас',todayLbl:'→ сегодня',builtIn:'встроенная',
+ fltAllCats:'Все',fltCustom:'Свой период',fltReset:'Сброс',fltApply:'Применить',fltFrom:'С',fltTo:'По',fltPeriod:'Период',sumTotal:'Всего',sumCount:'Записей',sumAvg:'Средний чек',sumShare:'От всех расходов',
  months:['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'],
  ms:['Янв','Фев','Мар','Апр','Май','Июн','Июл','Авг','Сен','Окт','Ноя','Дек'],
  cats:{food:'Еда',transport:'Транспорт',entertainment:'Развлечения',health:'Здоровье',shopping:'Покупки',housing:'Жильё',other:'Другое',salary:'Зарплата',freelance:'Фриланс',gift:'Подарок',investment:'Инвестиции'},
@@ -537,6 +600,7 @@ th:{flag:'🇹🇭',name:'ภาษาไทย',loc:'th-TH',
  createPrf:'สร้างโปรไฟล์',prsTitle:'การเงินส่วนตัว',
  switchPrf:'เปลี่ยน',activePrf:'ใช้งานอยู่',
  allWallets:'ทั้งหมด',curLabel:'ปัจจุบัน',todayLbl:'→ วันนี้',builtIn:'ค่าเริ่มต้น',
+ fltAllCats:'ทั้งหมด',fltCustom:'ช่วงที่กำหนด',fltReset:'ล้าง',fltApply:'ใช้',fltFrom:'จาก',fltTo:'ถึง',fltPeriod:'ช่วงเวลา',sumTotal:'รวม',sumCount:'รายการ',sumAvg:'เฉลี่ย',sumShare:'จากรายจ่ายทั้งหมด',
  months:['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'],
  ms:['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'],
  cats:{food:'อาหาร',transport:'การเดินทาง',entertainment:'บันเทิง',health:'สุขภาพ',shopping:'ช้อปปิ้ง',housing:'ที่อยู่',other:'อื่นๆ',salary:'เงินเดือน',freelance:'ฟรีแลนซ์',gift:'ของขวัญ',investment:'การลงทุน'},
@@ -598,6 +662,7 @@ de:{flag:'🇩🇪',name:'Deutsch',loc:'de-DE',
  createPrf:'Profil erstellen',prsTitle:'Persönliche Finanzen',
  switchPrf:'Wechseln',activePrf:'Aktiv',
  allWallets:'Alle',curLabel:'aktuell',todayLbl:'→ heute',builtIn:'Standard',
+ fltAllCats:'Alle',fltCustom:'Zeitraum',fltReset:'Zurücksetzen',fltApply:'Anwenden',fltFrom:'Von',fltTo:'Bis',fltPeriod:'Zeitraum',sumTotal:'Gesamt',sumCount:'Einträge',sumAvg:'Durchschnitt',sumShare:'Aller Ausgaben',
  months:['Januar','Februar','März','April','Mai','Juni','Juli','August','September','Oktober','November','Dezember'],
  ms:['Jan','Feb','Mär','Apr','Mai','Jun','Jul','Aug','Sep','Okt','Nov','Dez'],
  cats:{food:'Essen',transport:'Transport',entertainment:'Freizeit',health:'Gesundheit',shopping:'Einkauf',housing:'Wohnen',other:'Sonstiges',salary:'Gehalt',freelance:'Freelance',gift:'Geschenk',investment:'Investment'},
@@ -659,6 +724,7 @@ es:{flag:'🇪🇸',name:'Español',loc:'es-ES',
  createPrf:'Crear perfil',prsTitle:'Finanzas personales',
  switchPrf:'Cambiar',activePrf:'Activo',
  allWallets:'Todos',curLabel:'actual',todayLbl:'→ hoy',builtIn:'predeterminada',
+ fltAllCats:'Todas',fltCustom:'Periodo personalizado',fltReset:'Restablecer',fltApply:'Aplicar',fltFrom:'Desde',fltTo:'Hasta',fltPeriod:'Periodo',sumTotal:'Total',sumCount:'Registros',sumAvg:'Promedio',sumShare:'De todos los gastos',
  months:['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'],
  ms:['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'],
  cats:{food:'Comida',transport:'Transporte',entertainment:'Ocio',health:'Salud',shopping:'Compras',housing:'Vivienda',other:'Otros',salary:'Salario',freelance:'Freelance',gift:'Regalo',investment:'Inversión'},
@@ -720,6 +786,7 @@ fr:{flag:'🇫🇷',name:'Français',loc:'fr-FR',
  createPrf:'Créer profil',prsTitle:'Finances personnelles',
  switchPrf:'Changer',activePrf:'Actif',
  allWallets:'Tous',curLabel:'actuel',todayLbl:"→ aujourd'hui",builtIn:'par défaut',
+ fltAllCats:'Toutes',fltCustom:'Période personnalisée',fltReset:'Réinitialiser',fltApply:'Appliquer',fltFrom:'Du',fltTo:'Au',fltPeriod:'Période',sumTotal:'Total',sumCount:'Entrées',sumAvg:'Moyenne',sumShare:'De toutes les dépenses',
  months:['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'],
  ms:['Jan','Fév','Mar','Avr','Mai','Jun','Jul','Aoû','Sep','Oct','Nov','Déc'],
  cats:{food:'Alimentation',transport:'Transport',entertainment:'Loisirs',health:'Santé',shopping:'Achats',housing:'Logement',other:'Autre',salary:'Salaire',freelance:'Freelance',gift:'Cadeau',investment:'Investissement'},
@@ -781,6 +848,7 @@ zh:{flag:'🇨🇳',name:'中文',loc:'zh-CN',
  createPrf:'创建档案',prsTitle:'个人财务',
  switchPrf:'切换',activePrf:'当前',
  allWallets:'全部',curLabel:'当前',todayLbl:'→ 今天',builtIn:'内置',
+ fltAllCats:'全部',fltCustom:'自定义时段',fltReset:'重置',fltApply:'应用',fltFrom:'从',fltTo:'到',fltPeriod:'时段',sumTotal:'合计',sumCount:'笔数',sumAvg:'平均',sumShare:'占总支出',
  months:['一月','二月','三月','四月','五月','六月','七月','八月','九月','十月','十一月','十二月'],
  ms:['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
  cats:{food:'餐饮',transport:'交通',entertainment:'娱乐',health:'健康',shopping:'购物',housing:'住房',other:'其他',salary:'工资',freelance:'自由职业',gift:'礼物',investment:'投资'},
@@ -842,6 +910,7 @@ ja:{flag:'🇯🇵',name:'日本語',loc:'ja-JP',
  createPrf:'プロフィールを作成',prsTitle:'個人家計',
  switchPrf:'切り替え',activePrf:'使用中',
  allWallets:'すべて',curLabel:'現在',todayLbl:'→ 今日',builtIn:'組み込み',
+ fltAllCats:'すべて',fltCustom:'期間を指定',fltReset:'リセット',fltApply:'適用',fltFrom:'開始',fltTo:'終了',fltPeriod:'期間',sumTotal:'合計',sumCount:'件数',sumAvg:'平均',sumShare:'総支出に占める割合',
  months:['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
  ms:['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'],
  cats:{food:'食費',transport:'交通',entertainment:'娯楽',health:'医療',shopping:'買い物',housing:'住居',other:'その他',salary:'給与',freelance:'フリーランス',gift:'贈り物',investment:'投資'},
@@ -903,6 +972,7 @@ ko:{flag:'🇰🇷',name:'한국어',loc:'ko-KR',
  createPrf:'프로필 만들기',prsTitle:'개인 재정',
  switchPrf:'전환',activePrf:'활성',
  allWallets:'전체',curLabel:'현재',todayLbl:'→ 오늘',builtIn:'기본',
+ fltAllCats:'전체',fltCustom:'기간 지정',fltReset:'초기화',fltApply:'적용',fltFrom:'시작',fltTo:'종료',fltPeriod:'기간',sumTotal:'합계',sumCount:'건수',sumAvg:'평균',sumShare:'전체 지출 대비',
  months:['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'],
  ms:['1월','2월','3월','4월','5월','6월','7월','8월','9월','10월','11월','12월'],
  cats:{food:'식비',transport:'교통',entertainment:'오락',health:'건강',shopping:'쇼핑',housing:'주거',other:'기타',salary:'급여',freelance:'프리랜서',gift:'선물',investment:'투자'},
@@ -955,6 +1025,8 @@ let S={
  am:new Date().getMonth(),ay:new Date().getFullYear(),
  tp:'month',
  activeWallet:'all',
+ // Фильтры экрана History (не персистятся — сбрасываются при перезапуске)
+ fCat:'',fFrom:'',fTo:'',
  editId:null,
  form:{type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:'THB',walletId:'',receipt:null},
  nc:{label:'',emoji:'📦',type:'expense',desc:''},
@@ -976,13 +1048,16 @@ function gc(type,id){const a=type==='expense'?eCats():iCats();const b=a.find(c=>
 function gw(id){return S.wallets.find(w=>w.id===id)||null;}
 
 function persist(){
- sv('fv2_t',S.txns);sv('fv2_b',S.budgets);sv('fv2_c',S.custom);
+ // fv2_t — единственная незаменимая запись: её статус и возвращаем
+ const ok=sv('fv2_t',S.txns);
+ sv('fv2_b',S.budgets);sv('fv2_c',S.custom);
  sv('fv2_g',S.goals);sv('fv2_w',S.wallets);sv('fv2_tpl',S.templates);
  sv('fv2_cur',S.cur);sv('fv2_lang',S.lang);sv('fv2_su',S.sheetsUrl);sv('fv2_ss',S.sheetsSync);
  sv('fv2_pin',S.pin);
  sv('fv2_tomb',S.tomb);sv('fv2_outbox',S.outbox);
  sv('storageDays',S.storageClearDays);
  sv('lastPurge',S.lastPurge);
+ return ok;
 }
 
 function filterTxns(m,y,cur,walletId){
@@ -1299,14 +1374,132 @@ function screenHome(){
 // ════════════════════════════════════════
 // SCREEN: HISTORY
 // ════════════════════════════════════════
+// ── HISTORY: период и фильтр по категории ──
+
+// Транзакции периода БЕЗ фильтра по категории — база для сумм в чипах и доли
+function histPeriodTxns(){
+ const wid=S.activeWallet==='all'?null:S.activeWallet;
+ if(S.fFrom&&S.fTo){
+  // Даты хранятся как 'YYYY-MM-DD', поэтому строковое сравнение корректно
+  return S.txns.filter(tx=>
+   (tx.cur||'THB')===S.cur&&
+   (!wid||(tx.walletId||'')===wid)&&
+   tx.date>=S.fFrom&&tx.date<=S.fTo
+  ).sort((a,b)=>b.date.localeCompare(a.date)||String(b.createdAt||'').localeCompare(String(a.createdAt||'')));
+ }
+ return filterTxns(S.fm,S.fy,S.cur,wid);
+}
+
+// Лента категорий с суммами за период, по убыванию трат
+function catChips(base){
+ const l=t(),c=ci();
+ const tot={};
+ base.forEach(tx=>{
+  if(tx.type!=='expense')return;
+  const k=tx.cat||tx.category||'other';
+  tot[k]=(tot[k]||0)+tx.amount;
+ });
+ const ids=Object.keys(tot).sort((a,b)=>tot[b]-tot[a]);
+ if(S.fCat&&ids.indexOf(S.fCat)<0)ids.push(S.fCat); // выбрана, но пуста — чтобы можно было снять
+ const wrap=el('div',{style:{display:'flex',gap:'8px',padding:'0 16px 12px',overflowX:'auto'}});
+ const chip=(id,label,active)=>el('button',{class:'wchip',
+  style:{background:active?'#007AFF':'rgba(255,255,255,.1)',color:'#fff'},
+  onClick:()=>{S.fCat=S.fCat===id?'':id;render();}
+ },label);
+ wrap.appendChild(chip('',l.fltAllCats||'All',!S.fCat));
+ ids.forEach(id=>{
+  const g=gc('expense',id);
+  wrap.appendChild(chip(id,g.e+' '+g.label+' · '+fm(tot[id]||0,c.s),S.fCat===id));
+ });
+ return wrap;
+}
+
+// Кнопка произвольного диапазона + сброс
+function periodBar(){
+ const l=t();
+ const on=!!(S.fFrom&&S.fTo);
+ const row=el('div',{style:{display:'flex',gap:'8px',padding:'0 16px 12px',overflowX:'auto'}});
+ row.appendChild(el('button',{class:'wchip',
+  style:{background:on?'#007AFF':'rgba(255,255,255,.1)',color:'#fff'},
+  onClick:openPeriodSheet
+ },'📅 '+(on?fd(S.fFrom,l.loc)+' – '+fd(S.fTo,l.loc):(l.fltCustom||'Custom range'))));
+ if(on)row.appendChild(el('button',{class:'wchip',
+  style:{background:'rgba(255,255,255,.1)',color:'rgba(255,255,255,.6)'},
+  onClick:()=>{S.fFrom='';S.fTo='';render();}
+ },'✕ '+(l.fltReset||'Reset')));
+ return row;
+}
+
+function openPeriodSheet(){
+ const l=t();
+ const mFirst=S.fy+'-'+String(S.fm+1).padStart(2,'0')+'-01';
+ let from=S.fFrom||mFirst,to=S.fTo||td();
+ const ov=el('div',{style:{position:'fixed',inset:'0',zIndex:'1003',background:'rgba(0,0,0,.85)',display:'flex',alignItems:'flex-end',justifyContent:'center'},
+  onClick:e=>{if(e.target===ov)ov.remove();}});
+ const box=el('div',{style:{background:'#1C1C28',borderRadius:'20px 20px 0 0',padding:'22px 20px 40px',width:'100%',maxWidth:'430px'}});
+ box.appendChild(el('div',{style:{fontSize:'17px',fontWeight:'700',textAlign:'center',marginBottom:'18px'}},l.fltPeriod||'Period'));
+ const dateRow=(lbl,val,onCh)=>el('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',gap:'12px',marginBottom:'12px'}},
+  el('div',{style:{fontSize:'14px',color:'rgba(255,255,255,.6)'}},lbl),
+  el('input',{type:'date',value:val,class:'inp',style:{flex:'1',maxWidth:'190px',fontSize:'14px',padding:'9px 10px'},onChange:e=>onCh(e.target.value)})
+ );
+ box.appendChild(dateRow(l.fltFrom||'From',from,v=>{from=v;}));
+ box.appendChild(dateRow(l.fltTo||'To',to,v=>{to=v;}));
+ box.appendChild(el('button',{
+  style:{width:'100%',background:'#007AFF',border:'none',borderRadius:'14px',padding:'14px',color:'#fff',fontSize:'15px',fontWeight:'700',marginTop:'8px',marginBottom:'10px',cursor:'pointer'},
+  onClick:()=>{
+   if(!from||!to)return;
+   if(from>to){const sw=from;from=to;to=sw;} // подстраховка от перепутанных дат
+   S.fFrom=from;S.fTo=to;ov.remove();render();
+  }
+ },l.fltApply||'Apply'));
+ box.appendChild(el('button',{
+  style:{width:'100%',background:'none',border:'none',color:'rgba(255,255,255,.45)',fontSize:'14px',cursor:'pointer',padding:'6px'},
+  onClick:()=>{S.fFrom='';S.fTo='';ov.remove();render();}
+ },l.fltReset||'Reset'));
+ ov.appendChild(box);
+ document.body.appendChild(ov);
+}
+
+// Сводка по выбранной категории за период
+function catSummary(base,shown){
+ const l=t(),c=ci();
+ const allExp=base.reduce((s,tx)=>tx.type==='expense'?s+tx.amount:s,0);
+ const exp=shown.filter(tx=>tx.type==='expense');
+ const total=exp.reduce((s,tx)=>s+tx.amount,0);
+ const n=exp.length;
+ const avg=n?total/n:0;
+ const share=allExp>0?(total/allExp)*100:0;
+ const g=gc('expense',S.fCat);
+ const card=el('div',{class:'card',style:{padding:'14px 16px'}});
+ card.appendChild(el('div',{style:{display:'flex',alignItems:'center',gap:'8px',marginBottom:'12px'}},
+  el('div',{style:{fontSize:'20px'}},g.e),
+  el('div',{style:{fontWeight:'700',fontSize:'15px'}},g.label)
+ ));
+ const cell=(lbl,val,color)=>el('div',{},
+  el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.45)',marginBottom:'3px'}},lbl),
+  el('div',{style:{fontSize:'15px',fontWeight:'700',color:color||'#fff'}},val)
+ );
+ card.appendChild(el('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}},
+  cell(l.sumTotal||'Total','−'+fm(total,c.s),'#FF3B30'),
+  cell(l.sumCount||'Records',String(n)),
+  cell(l.sumAvg||'Average',fm(avg,c.s)),
+  cell(l.sumShare||'Of all expenses',share.toFixed(1)+'%')
+ ));
+ return card;
+}
+
 function screenHistory(){
- const l=t(),c=ci(),wid=S.activeWallet==='all'?null:S.activeWallet;
- const txns=filterTxns(S.fm,S.fy,S.cur,wid);
+ const l=t(),c=ci();
+ const base=histPeriodTxns();                                        // период целиком
+ const txns=S.fCat?base.filter(tx=>(tx.cat||tx.category)===S.fCat):base;
  const totE=sum(txns,'expense'),totI=sum(txns,'income');
  const w=el('div',{class:'screen'});
  w.appendChild(el('div',{class:'ph'},el('div',{class:'pt'},l.hist),curBtn(()=>curSheet(S.cur,code=>{S.cur=code;persist();render();}))));
  w.appendChild(walletBar());
- w.appendChild(monthNav('f'));
+ if(!(S.fFrom&&S.fTo))w.appendChild(monthNav('f'));                  // свой диапазон отменяет месяц
+ w.appendChild(periodBar());
+ w.appendChild(catChips(base));
+ if(S.fCat)w.appendChild(catSummary(base,txns));
  w.appendChild(el('div',{style:{display:'flex',gap:'10px',padding:'0 16px 12px'}},
   el('div',{style:{flex:'1',background:'rgba(52,199,89,.12)',borderRadius:'14px',padding:'11px 14px'}},el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.5)',marginBottom:'2px'}},l.inc),el('div',{style:{fontWeight:'700',color:'#34C759',fontSize:'15px'}},'+'+fm(totI,c.s))),
   el('div',{style:{flex:'1',background:'rgba(255,59,48,.12)',borderRadius:'14px',padding:'11px 14px'}},el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.5)',marginBottom:'2px'}},l.exp),el('div',{style:{fontWeight:'700',color:'#FF3B30',fontSize:'15px'}},'−'+fm(totE,c.s)))
@@ -2264,7 +2457,17 @@ async function sheetsPost(obj){
 }
 
 // ── OUTBOX: очередь доставки в Sheets (переживает офлайн/закрытие) ──
+const OUTBOX_MAX=300;
 let _obFlushing=false;
+
+// Единственная точка записи в очередь: без base64 и с ограничением длины.
+function pushOutbox(item){
+ if(item&&item.tx&&item.tx.photo){const{photo,...rest}=item.tx;item={...item,tx:{...rest,photoRef:rest.id}};}
+ S.outbox.push(item);
+ if(S.outbox.length>OUTBOX_MAX)S.outbox=S.outbox.slice(-OUTBOX_MAX);
+ sv('fv2_outbox',S.outbox);
+}
+
 async function flushOutbox(){
  if(_obFlushing||!S.sheetsUrl||!S.sheetsSync||!S.outbox.length)return;
  _obFlushing=true;
@@ -2272,6 +2475,12 @@ async function flushOutbox(){
   while(S.outbox.length){
    let item=S.outbox[0];
    if(!item.action)item={action:'add',tx:item}; // старый формат очереди
+   // Фото подтягиваем из IndexedDB только на момент отправки
+   if(item.tx&&item.tx.photoRef&&!item.tx.photo){
+    const b64=await getPhoto(item.tx.photoRef);
+    const{photoRef,...rest}=item.tx;
+    item={...item,tx:b64?{...rest,photo:b64}:rest};
+   }
    const r=await sheetsPost(item);
    if(r===null)break; // офлайн — повторим при online/старте
    if(r.ok){
@@ -2306,8 +2515,9 @@ function addTxn(){
    S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
    S.editId=null;
    S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};
-   persist();toast(l.saved);S.screen='history';render();
-   if(S.sheetsUrl&&S.sheetsSync){const{idemKey:_k,...txClean}=old;if(f.receipt)txClean.photo=f.receipt;old.synced=false;S.outbox.push({action:'update',tx:txClean});sv('fv2_outbox',S.outbox);flushOutbox();}
+   if(persist())toast(l.saved);else toast(l.notSaved||'⚠️ Not saved — storage full',true);
+   S.screen='history';render();
+   if(S.sheetsUrl&&S.sheetsSync){const{idemKey:_k,...txClean}=old;if(f.receipt)txClean.photoRef=old.id;old.synced=false;pushOutbox({action:'update',tx:txClean});flushOutbox();}
    return;
   }
   S.editId=null;
@@ -2340,13 +2550,16 @@ function addTxn(){
  S.txns.unshift(tx);
  // BUG FIX: refresh date to today when clearing form
  S.form={type:'expense',amt:'',cat:'',note:'',tags:'',date:td(),cur:S.cur,walletId:'',receipt:null};
- persist();toast(l.saved);S.screen='home';render();
+ if(persist())toast(l.saved);else toast(l.notSaved||'⚠️ Not saved — storage full',true);
+ S.screen='home';render();
  setTimeout(()=>_txnSaving=false,1000);
 
  if(S.sheetsUrl&&S.sheetsSync){
   const{idemKey:_k,...txClean}=tx;
-  if(hasReceipt&&f.receipt)txClean.photo=f.receipt;
-  S.outbox.push({action:'add',tx:txClean});sv('fv2_outbox',S.outbox);
+  // Reference only — the base64 photo stays in IndexedDB and is attached
+  // at send time. Queuing it here would blow the ~5MB localStorage budget.
+  if(hasReceipt&&f.receipt)txClean.photoRef=txId;
+  pushOutbox({action:'add',tx:txClean});
   flushOutbox();
  }
 }
@@ -2491,7 +2704,19 @@ async function checkStorageStatus(){
 }
 
 // Call on startup — check and warn if needed
+// Одноразовая миграция: старые версии клали base64-фото прямо в очередь,
+// что съедало ~5MB localStorage и приводило к ложному "Storage Full".
+function migrateOutbox(){
+ const[q,changed]=stripOutboxPhotos(S.outbox);
+ const capped=q.length>OUTBOX_MAX?q.slice(-OUTBOX_MAX):q;
+ if(changed||capped.length!==S.outbox.length){
+  S.outbox=capped;
+  sv('fv2_outbox',S.outbox);
+ }
+}
+
 async function startupStorageCheck(){
+ migrateOutbox();
  await smartPurge();
  // Request persistent storage (makes data survive like native app)
  requestPersistentStorage();
@@ -2908,6 +3133,8 @@ function selectProfile(id){
  S.lastPurge=ld('lastPurge',null);
  S.screen='home';S.pinLocked=!!S.pin;
  S._storageAlert=null;
+ S.fCat='';S.fFrom='';S.fTo='';
+ migrateOutbox();
 
  // Автобэкап при каждом переключении профиля
  autoBackup();
