@@ -2117,6 +2117,11 @@ function screenSettings(){
   el('button',{style:{flex:'1',background:'rgba(255,159,10,.15)',border:'.5px solid rgba(255,159,10,.3)',borderRadius:'10px',padding:'9px',color:'#FF9F0A',fontSize:'13px',fontWeight:'600'},
    onClick:syncAllToSheets},'🔄 '+(l.syncAll||'Sync all'))
  ));
+ shR.appendChild(el('div',{style:{display:'flex',marginTop:'8px'}},
+  el('button',{style:{flex:'1',background:'rgba(175,82,222,.15)',border:'.5px solid rgba(175,82,222,.3)',borderRadius:'10px',padding:'9px',color:'#BF5AF2',fontSize:'13px',fontWeight:'600'},
+   onClick:shareLinkDevice},'📲 Link another phone')
+ ));
+ if(S.lastPull)shR.appendChild(el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.35)',marginTop:'8px'}},'Last sync: '+new Date(S.lastPull).toLocaleTimeString(l.loc||'en-US',{hour:'2-digit',minute:'2-digit'})));
  dc.appendChild(shR);
  dc.appendChild(el('div',{class:'sr',onClick:()=>{const now=new Date();generatePDF(now.getMonth(),now.getFullYear());}},
   el('div',{},el('div',{style:{fontWeight:'600',fontSize:'15px'}},'📄 Monthly PDF Report'),el('div',{style:{fontSize:'11px',color:'rgba(255,255,255,.4)'}},t().months[new Date().getMonth()]+' '+new Date().getFullYear())),
@@ -2148,9 +2153,11 @@ function testSheets(){
 }
 
 // ── SYNC v2: полный двухсторонний reconcile с Google Sheets ──
+let _pulling=false;
 async function importFromSheets(silent){
  const l=t();
  if(!S.sheetsUrl){if(!silent)toast(l.shNot,true);return;}
+ if(_pulling)return;_pulling=true;
  if(!silent)toast('Syncing with Sheets...');
  try{
   const res=await fetch(S.sheetsUrl,{method:'GET'});
@@ -2163,7 +2170,8 @@ async function importFromSheets(silent){
   const byId=new Map(S.txns.filter(x=>x.id).map(x=>[String(x.id),x]));
   const existing=new Set(S.txns.map(tx=>tx.idemKey||`${tx.type}|${tx.amount}|${tx.cat}|${tx.date}|${tx.cur}`));
   const sheetIds=new Set();
-  let imported=0,removed=0;
+  const pend=new Set(S.outbox.map(o=>(o.tx&&o.tx.id)||o.id).filter(Boolean).map(String));
+  let imported=0,removed=0,updated=0;
   data.rows.forEach(row=>{
    const date=String(row[0]).slice(0,10),type=row[1],amount=parseFloat(row[2]);
    if(!date||!type||isNaN(amount))return;
@@ -2182,8 +2190,17 @@ async function importFromSheets(silent){
    }
    // уже есть локально → отметить синк, подтянуть фото-ссылку
    if(rid&&byId.has(rid)){
-    const tx0=byId.get(rid);tx0.synced=true;
+    const tx0=byId.get(rid);
     if(photoUrl&&!tx0.photoUrl)tx0.photoUrl=photoUrl;
+    // MULTI-DEVICE: правка с другого телефона. Таблица — источник истины для уже синканных записей,
+    // локальные неотправленные правки (outbox) не трогаем.
+    if(!pend.has(rid)){
+     const nv={date,type,amount,cur,cat,note:String(note),tags:String(tags)};
+     let ch=false;
+     for(const k in nv){if(String(tx0[k]??'')!==String(nv[k])){tx0[k]=nv[k];ch=true;}}
+     if(ch){tx0.idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;updated++;}
+     tx0.synced=true;
+    }
     return;
    }
    const idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;
@@ -2193,17 +2210,71 @@ async function importFromSheets(silent){
    existing.add(idemKey);imported++;
   });
   // физически стёртые из таблицы строки → удалить локально (только синканные, и не ждущие в outbox)
-  if(v2){
-   const pend=new Set(S.outbox.map(o=>(o.tx&&o.tx.id)||o.id).filter(Boolean));
+  // Защита: пустой/обрезанный ответ таблицы не должен стереть данные на всех телефонах
+  const syncedLocal=S.txns.filter(tx=>tx.synced).length;
+  const suspicious=syncedLocal>5&&sheetIds.size<syncedLocal*0.5;
+  if(v2&&!suspicious){
    const before=S.txns.length;
-   S.txns=S.txns.filter(tx=>!(tx.id&&tx.synced&&!sheetIds.has(String(tx.id))&&!pend.has(tx.id)));
+   S.txns=S.txns.filter(tx=>!(tx.id&&tx.synced&&!sheetIds.has(String(tx.id))&&!pend.has(String(tx.id))));
    removed+=before-S.txns.length;
   }
   S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
   persist();autoBackup();
-  if(imported>0||removed>0){toast(`Sheets ✓ +${imported}${removed?' / −'+removed:''}`);render();}
+  S.lastPull=Date.now();
+  if(imported>0||removed>0||updated>0){
+   toast(`Sheets ✓ +${imported}${updated?' ✎'+updated:''}${removed?' / −'+removed:''}`);
+   if(!LIVE_NO_RENDER.has(S.screen)&&!document.querySelector('.ovl,[style*="z-index: 500"]'))render();
+  }
   else if(!silent)toast('All data up to date ✓');
  }catch(e){if(!silent)toast('Import failed — check Apps Script',true);}
+ finally{_pulling=false;}
+}
+
+// ── LIVE SYNC: один аккаунт на нескольких телефонах ──
+// iOS не перезагружает PWA при возврате из фона, поэтому тянем изменения
+// при возврате в приложение, по таймеру и после выхода в сеть.
+const LIVE_NO_RENDER=new Set(['add','addCat','addWallet','addTemplate','manageCats']);
+let _lastLive=0;
+async function liveSync(force){
+ if(!S.sheetsUrl||!S.sheetsSync||!navigator.onLine||S.pinLocked)return;
+ if(!force&&Date.now()-_lastLive<20000)return;
+ _lastLive=Date.now();
+ await flushOutbox();
+ await importFromSheets(true);
+}
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')liveSync();});
+window.addEventListener('focus',()=>liveSync());
+window.addEventListener('pageshow',()=>liveSync());
+setInterval(()=>{if(document.visibilityState==='visible')liveSync();},60000);
+
+// ── ПРИВЯЗКА ВТОРОГО ТЕЛЕФОНА: ссылка с webhook ──
+function linkDeviceUrl(){
+ return location.origin+location.pathname+'#join='+encodeURIComponent(btoa(S.sheetsUrl));
+}
+async function shareLinkDevice(){
+ if(!S.sheetsUrl){toast(t().shNot,true);return;}
+ const url=linkDeviceUrl();
+ try{
+  if(navigator.share){await navigator.share({title:'My Finances — link device',url});return;}
+ }catch(e){if(e&&e.name==='AbortError')return;}
+ try{await navigator.clipboard.writeText(url);toast('Link copied ✓');}
+ catch{prompt('Copy this link',url);}
+}
+(function captureJoin(){
+ const m=location.hash.match(/join=([^&]+)/);
+ if(!m)return;
+ try{localStorage.setItem('fv2_pending_join',atob(decodeURIComponent(m[1])));}catch{}
+ history.replaceState(null,'',location.pathname);
+})();
+function checkPendingJoin(){
+ let url;try{url=localStorage.getItem('fv2_pending_join');}catch{return;}
+ if(!url||!/^https:\/\/script\.google\.com\//.test(url)){try{localStorage.removeItem('fv2_pending_join');}catch{}return;}
+ if(url===S.sheetsUrl){localStorage.removeItem('fv2_pending_join');return;}
+ localStorage.removeItem('fv2_pending_join');
+ confirm2('Connect this phone to the same account? Data will be loaded from Google Sheets.',()=>{
+  S.sheetsUrl=url;S.sheetsSync=true;persist();autoBackup();
+  importFromSheets(false);render();
+ });
 }
 
 // ── Push ALL local transactions to Sheets (backfill + фото). Дедуп на сервере ──
@@ -3294,8 +3365,10 @@ function render(){
   return;
  }
 
+ // Привязка второго телефона по ссылке
+ if(localStorage.getItem('fv2_pending_join')&&!S.pinLocked) setTimeout(()=>checkPendingJoin(),300);
  // Check if data was lost and offer restore
- if(S.txns.length===0) setTimeout(()=>checkAndRestoreBackup(),500);
+ else if(S.txns.length===0) setTimeout(()=>checkAndRestoreBackup(),500);
 
  // PIN lock
  if(S.pin&&S.pinLocked){
@@ -3348,7 +3421,7 @@ if(S.txns.length>0) autoBackup();
 // Storage check
 startupStorageCheck().then(()=>render());
 setTimeout(()=>flushOutbox(),1500);
-setTimeout(()=>{if(S.sheetsUrl&&S.sheetsSync&&navigator.onLine)importFromSheets(true);},4000);
+setTimeout(()=>liveSync(true),4000);
 render();
 </script>
 <script>
