@@ -1044,7 +1044,9 @@ function t(){return L[S.lang]||L.en;}
 function ci(){return CURS.find(c=>c.c===S.cur)||CURS[0];}
 function eCats(){return[...EC,...S.custom.filter(c=>c.type==='expense')];}
 function iCats(){return[...IC,...S.custom.filter(c=>c.type==='income')];}
-function gc(type,id){const a=type==='expense'?eCats():iCats();const b=a.find(c=>c.id===id);if(!b)return{e:'📦',label:id};return{e:b.e||'📦',label:t().cats[b.id]||b.label||b.id};}
+// Категория из таблицы/бота может прийти названием ("DJ Shop") или чужим ID другого телефона
+function resolveCat(type,cat){const a=type==='expense'?eCats():iCats();if(!cat||a.some(c=>c.id===cat))return cat;const n=String(cat).trim().toLowerCase();const b=a.find(c=>String(c.label||'').trim().toLowerCase()===n||String((t().cats||{})[c.id]||'').toLowerCase()===n);return b?b.id:cat;}
+function gc(type,id){const a=type==='expense'?eCats():iCats();const b=a.find(c=>c.id===id)||a.find(c=>c.id===resolveCat(type,id));if(!b)return{e:'📦',label:id};return{e:b.e||'📦',label:t().cats[b.id]||b.label||b.id};}
 function gw(id){return S.wallets.find(w=>w.id===id)||null;}
 
 function persist(){
@@ -2175,7 +2177,7 @@ async function importFromSheets(silent){
   data.rows.forEach(row=>{
    const date=String(row[0]).slice(0,10),type=row[1],amount=parseFloat(row[2]);
    if(!date||!type||isNaN(amount))return;
-   const cur=row[3]||'THB',cat=row[4]||'other',note=row[5]||'',tags=row[6]||'';
+   const cur=row[3]||'THB',cat=resolveCat(type,row[4]||'other'),note=row[5]||'',tags=row[6]||'';
    if(note==='__connection_test__')return;
    const rid=v2?String(row[9]||''):'',status=v2?String(row[10]||''):'',photoUrl=v2?String(row[11]||''):'';
    if(rid&&status!=='deleted')sheetIds.add(rid);
@@ -2521,6 +2523,8 @@ function screenAdd(){
 
 // ── SYNC v2: POST c читаемым ответом (text/plain = simple request, без preflight) ──
 async function sheetsPost(obj){
+ // Пользовательские категории уходят в таблицу названием: ID у каждого телефона свой
+ if(obj&&obj.tx&&obj.tx.cat){const c=S.custom.find(x=>x.id===obj.tx.cat);if(c&&c.label)obj={...obj,tx:{...obj.tx,cat:c.label}};}
  try{
   const res=await fetch(S.sheetsUrl,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(obj)});
   return await res.json();
