@@ -217,10 +217,13 @@ async def sheets_post(obj: dict) -> dict | None:
         r = await c.post(SHEETS_URL, content=json.dumps(obj),
                          headers={"Content-Type": "text/plain;charset=utf-8"})
         try:
-            return r.json()
+            j = r.json()
+            if not (isinstance(j, dict) and j.get("ok")):
+                log.error("sheets rejected %s %s", r.status_code, str(j)[:300])
+            return j
         except Exception:
-            log.error("sheets non-json %s %s", r.status_code, r.text[:200])
-            return None
+            log.error("sheets non-json %s %s %s", r.status_code, r.headers.get("content-type"), r.text[:300])
+            return {"ok": False, "error": f"HTTP {r.status_code}, not JSON (access to the script?)"}
 
 
 def tx_id_for(p: dict, items: list) -> str:
@@ -365,9 +368,24 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     ph = photo_for(p, items, all_pays)
     if ph:
         tx["photo"] = ph
-    r = await sheets_post({"action": "add", "tx": tx})
+    if not SHEETS_URL:
+        return False, "SHEETS_URL is not set"
+    try:
+        r = await sheets_post({"action": "add", "tx": tx})
+    except Exception as e:
+        log.exception("sheets post failed")
+        r = {"ok": False, "error": type(e).__name__}
+    if not (r and r.get("ok")) and "photo" in tx:   # вдруг мешает фото — пробуем без него
+        tx.pop("photo")
+        try:
+            r2 = await sheets_post({"action": "add", "tx": tx})
+        except Exception:
+            r2 = None
+        if r2 and r2.get("ok"):
+            r = r2; log.warning("saved without photo")
     if not (r and r.get("ok")):
-        return False, "failed to write to the sheet"
+        err = (r or {}).get("error") or (r or {}).get("message") or str(r)[:120]
+        return False, f"failed to write to the sheet: {err}"
     if p.get("ref"):
         db.execute("insert or ignore into seen values(?,?,?)", (p["ref"], txid, int(time.time())))
         db.commit()
