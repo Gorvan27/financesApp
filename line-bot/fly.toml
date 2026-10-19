@@ -1,4 +1,4 @@
-app = "shop-accountant"
+app = "dj-shop-accountant"
 primary_region = "sin"
 
 [build]
