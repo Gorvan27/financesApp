@@ -470,7 +470,11 @@ async def process_cash_notes(group, items, reply_token):
                 continue
             p["ref"] = None
             p["_txid"] = f"line_c{it['msg_id']}_{k}"
-            ok, info = await write(p, [], None)
+            try:
+                ok, info = await write(p, [], None)
+            except Exception as e:
+                log.exception("cash write failed")
+                ok, info = False, f"error {type(e).__name__}"
             if ok:
                 lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
             else:
@@ -521,7 +525,11 @@ async def process_batch(key):
                    else bad_date or p.get("issue") or "not sure")
             doubts.append((p, f"⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, reply \"+\" to this message."))
             continue
-        ok, info = await write(p, items, pays)
+        try:
+            ok, info = await write(p, items, pays)
+        except Exception as e:  # никогда не молчим: любая ошибка записи — сообщение в группу
+            log.exception("write failed")
+            ok, info = False, f"error {type(e).__name__}"
         if ok:
             lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
         elif info == "dup":
