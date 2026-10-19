@@ -376,18 +376,19 @@ def fmt(p: dict) -> str:
     except Exception:
         pass
     desc = p.get("description") or "no description"
-    return f"{amt} ฿ · {desc} · {d}"
+    w = "💵 Cash" if p.get("wallet") == "w_cash" else "💳 Card"
+    return f"{amt} ฿ · {desc} · {d} · {w}"
 
 
 async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[bool, str]:
-    txid = tx_id_for(p, items)
+    txid = p.get("_txid") or tx_id_for(p, items)
     if p.get("ref") and db.execute("select 1 from seen where ref=?", (p["ref"],)).fetchone():
         return False, "dup"
     if DRY_RUN:
         return True, txid
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
-          "note": p.get("description") or "", "tags": "line", "date": p["date"], "cur": "THB",
-          "walletId": "", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": True}
+          "note": p.get("description") or "", "date": p["date"], "cur": "THB",
+          "tags": "line,wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
     ph = photo_for(p, items, all_pays)
     if ph:
         tx["photo"] = ph
@@ -419,6 +420,63 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     return True, txid
 
 
+# ════════ записи наличными: «Wood -1200 cash», «ค่าน้ำ 350 บาท เงินสด» ════════
+CASH_RE = re.compile(r"cash|кэш|кеш|нал(?:ичн|ом|ик)|เงินสด|จ่ายสด", re.I)
+CUR_RE = re.compile(r"thb|baht|bath|бат\w*|б\.|บาท|฿", re.I)
+NUM_RE = re.compile(r"(?<![\w.])-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\w.])-?\d+(?:\.\d+)?")
+
+
+def parse_cash_note(text: str, ts_ms: int | None) -> list:
+    """Строки с суммой из сообщения, где есть пометка «наличные». Без пометки — не трата."""
+    if not text or not CASH_RE.search(text):
+        return []
+    sent = datetime.fromtimestamp((ts_ms or time.time() * 1000) / 1000, tz=timezone(timedelta(hours=7)))
+    out = []
+    for line in text.splitlines():
+        nums = [m for m in NUM_RE.finditer(line) if abs(float(m.group().replace(",", ""))) >= 1]
+        if not nums:
+            continue
+        if len(nums) > 1:   # несколько чисел — берём то, что рядом с валютой/кэшем, иначе спрашиваем
+            near = [m for m in nums if CUR_RE.search(line[m.end():m.end() + 8]) or CASH_RE.search(line[m.end():m.end() + 8])]
+            if len(near) != 1:
+                out.append({"amount": None, "raw": line.strip()}); continue
+            nums = near
+        m = nums[0]
+        amount = abs(float(m.group().replace(",", "")))
+        desc = line[:m.start()] + " " + line[m.end():]
+        desc = CASH_RE.sub(" ", CUR_RE.sub(" ", desc))
+        desc = re.sub(r"[()\[\],:;+\-–—=/]+", " ", desc)
+        desc = re.sub(r"\s+", " ", desc).strip()
+        out.append({"amount": amount, "date": sent.strftime("%Y-%m-%d"), "description": desc[:1].upper() + desc[1:],
+                    "wallet": "w_cash", "raw": line.strip()})
+    return out
+
+
+async def process_cash_notes(group, items, reply_token):
+    lines, written = [], []
+    for it in items:
+        if it["kind"] != "text":
+            continue
+        for k, p in enumerate(parse_cash_note(it.get("text", ""), it.get("ts"))):
+            if p["amount"] is None:
+                lines.append(f"⚠️ «{p['raw'][:60]}» — several amounts, not saved. Please write one amount per line.")
+                continue
+            p["ref"] = None
+            p["_txid"] = f"line_c{it['msg_id']}_{k}"
+            ok, info = await write(p, [], None)
+            if ok:
+                lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
+            else:
+                lines.append(f"⚠️ {fmt(p)} — {info}")
+    if not lines:
+        return
+    text = "\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message)")
+    ids = await send_many(group, reply_token, [text])
+    if ids and written and not DRY_RUN:
+        db.execute("insert or replace into written values(?,?,?)", (ids[0], json.dumps(written), int(time.time())))
+        db.commit()
+
+
 # ════════ обработка пачки ════════
 async def process_batch(key):
     await asyncio.sleep(BATCH_WAIT)
@@ -427,7 +485,9 @@ async def process_batch(key):
         return
     group, items = key[0], b["items"]
     if not any(i["kind"] in ("image", "pdf") for i in items):
-        return  # только текст без вложений — не наше дело
+        # без вложений: пишем только явные записи наличными («Wood 1200 cash»), остальное — переписка
+        await process_cash_notes(group, items, b.get("reply"))
+        return
     try:
         res = await analyze(items)
     except Exception as e:
