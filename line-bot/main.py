@@ -36,6 +36,8 @@ db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute("create table if not exists seen(ref text primary key, tx_id text, ts integer)")
 db.execute("create table if not exists pending(msg_id text primary key, payload text, ts integer)")
 db.execute("create table if not exists written(msg_id text primary key, tx_id text, ts integer)")
+db.execute("delete from seen where ref like '%XX%' or ref like '%xx%'")  # старые «ref» = маска счёта
+db.commit()
 db.commit()
 
 # ── пачки: (group, user) → {"items": [...], "task": Task} ──
@@ -144,7 +146,8 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   Тайские месяцы: ม.ค.=01 ก.พ.=02 มี.ค.=03 เม.ย.=04 พ.ค.=05 มิ.ย.=06 ก.ค.=07 ส.ค.=08 ก.ย.=09
   ต.ค.=10 พ.ย.=11 ธ.ค.=12. Внимательно: ต.ค. — октябрь, ก.ค. — июль, พ.ค. — май.
   Дата оплаты — со слипа, не с чека.
-- ref — номер транзакции со слипа (เลขที่รายการ / หมายเลขอ้างอิง / Transaction ID).
+- ref — номер ОПЕРАЦИИ со слипа (หมายเลขอ้างอิง / เลขที่รายการ / Transaction ID), обычно длинный,
+  например «KSA00000001007829174». НЕ номер счёта (счета маскированы: «XXX-XXX-5611», «xxx-x-x1244-x»).
 - description — коротко НА АНГЛИЙСКОМ, ЗА ЧТО платили: из подписи человека (Wood → «Wood», Water → «Water») и/или из контекста («BOSCH drill, Shopee», «Delivery, Thailand Post»).
   Название банка или способа оплаты (PromptPay, KBIZ) — НЕ описание. Не выдумывай товар.
   Если ничего не известно — пустая строка.
@@ -236,6 +239,14 @@ async def sheets_post(obj: dict) -> dict | None:
         except Exception:
             log.error("sheets non-json %s %s %s", r.status_code, r.headers.get("content-type"), r.text[:300])
             return {"ok": False, "error": f"HTTP {r.status_code}, not JSON (access to the script?)"}
+
+
+def clean_ref(ref: str | None) -> str | None:
+    """Номер операции, а не маскированный номер счёта."""
+    r = (ref or "").strip()
+    if not r or re.search(r"[Xx]{2,}", r) or len(re.sub(r"[^A-Za-z0-9]", "", r)) < 8:
+        return None
+    return r
 
 
 def tx_id_for(p: dict, items: list) -> str:
@@ -428,6 +439,7 @@ async def process_batch(key):
         return
     lines, doubts, written = [], [], []
     for p in pays:
+        p["ref"] = clean_ref(p.get("ref"))
         fixed = parse_slip_date(p.get("date_raw"))
         if fixed and fixed != p.get("date"):
             log.info("date fixed %s -> %s (raw %r)", p.get("date"), fixed, p.get("date_raw"))
