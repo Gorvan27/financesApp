@@ -212,8 +212,20 @@ async def analyze(items: list) -> dict:
 
 
 # ════════ Google Sheets (тот же webhook, что у приложения) ════════
+async def sheet_has(txid: str) -> bool:
+    """Есть ли строка с этим id в таблице (doGet → rows, id в колонке 9)."""
+    try:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+            r = await c.get(SHEETS_URL)
+            rows = (r.json() or {}).get("rows") or []
+        return any(len(x) > 9 and str(x[9]) == txid for x in rows)
+    except Exception as e:
+        log.warning("sheet_has failed: %s", e)
+        return False
+
+
 async def sheets_post(obj: dict) -> dict | None:
-    async with httpx.AsyncClient(timeout=90, follow_redirects=True) as c:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(240, connect=20), follow_redirects=True) as c:
         r = await c.post(SHEETS_URL, content=json.dumps(obj),
                          headers={"Content-Type": "text/plain;charset=utf-8"})
         try:
@@ -373,16 +385,20 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     try:
         r = await sheets_post({"action": "add", "tx": tx})
     except Exception as e:
-        log.exception("sheets post failed")
+        log.warning("sheets post %s — проверяю, дошла ли строка", type(e).__name__)
         r = {"ok": False, "error": type(e).__name__}
-    if not (r and r.get("ok")) and "photo" in tx:   # вдруг мешает фото — пробуем без него
-        tx.pop("photo")
-        try:
-            r2 = await sheets_post({"action": "add", "tx": tx})
-        except Exception:
-            r2 = None
-        if r2 and r2.get("ok"):
-            r = r2; log.warning("saved without photo")
+    if not (r and r.get("ok")):
+        # Таймаут ≠ провал: Apps Script мог дописать строку. Проверяем, прежде чем слать повторно.
+        if await sheet_has(txid):
+            r = {"ok": True}
+        elif "photo" in tx:
+            tx.pop("photo")
+            try:
+                r2 = await sheets_post({"action": "add", "tx": tx})
+            except Exception as e:
+                r2 = {"ok": False, "error": type(e).__name__}
+            if (r2 and r2.get("ok")) or await sheet_has(txid):
+                r = {"ok": True}; log.warning("saved without photo")
     if not (r and r.get("ok")):
         err = (r or {}).get("error") or (r or {}).get("message") or str(r)[:120]
         return False, f"failed to write to the sheet: {err}"
