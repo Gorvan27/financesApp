@@ -131,6 +131,8 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   переписки — НЕ оплата, это пояснение к оплате рядом (сверяй по сумме, в т.ч. юани→бат в скобках).
 - Если есть и слип, и PDF/скрин на ту же сумму — это ОДНА оплата.
 - Даты в тайском формате: «16 ต.ค. 69» / 2569 — это буддийский год, вычти 543 (69 → 2026).
+  Тайские месяцы: ม.ค.=01 ก.พ.=02 มี.ค.=03 เม.ย.=04 พ.ค.=05 มิ.ย.=06 ก.ค.=07 ส.ค.=08 ก.ย.=09
+  ต.ค.=10 พ.ย.=11 ธ.ค.=12. Внимательно: ต.ค. — октябрь, ก.ค. — июль, พ.ค. — май.
 - ref — номер транзакции со слипа (เลขที่รายการ / หมายเลขอ้างอิง / Order ID / Transaction ID).
 - description — коротко по-русски: подпись человека (Wood → «Дерево», Water → «Вода») и/или
   что куплено, если видно на скрине заказа. Если ничего не известно — пустая строка.
@@ -219,6 +221,23 @@ def photo_for(p: dict, items: list) -> str | None:
     return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode() if jpeg else None
 
 
+def date_suspicious(p: dict, items: list) -> str | None:
+    """Дата слипа не может быть позже сообщения и вряд ли старше 60 дней."""
+    try:
+        d = datetime.strptime(p.get("date") or "", "%Y-%m-%d").date()
+    except Exception:
+        return None
+    ts = [i.get("ts") for i in items if i.get("ts")]
+    if not ts:
+        return None
+    sent = datetime.fromtimestamp(max(ts) / 1000, tz=timezone(timedelta(hours=7))).date()
+    if d > sent + timedelta(days=1):
+        return "дата позже сообщения — проверь месяц"
+    if d < sent - timedelta(days=60):
+        return "дата старше 60 дней — проверь месяц"
+    return None
+
+
 def fmt(p: dict) -> str:
     amt = f"{p['amount']:,.2f}".replace(",", " ") if p.get("amount") is not None else "?"
     d = p.get("date") or "?"
@@ -271,10 +290,11 @@ async def process_batch(key):
         return
     lines, doubts, written = [], [], []
     for p in pays:
+        bad_date = date_suspicious(p, items)
         doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
-            or p.get("amount") in (None, 0) or not p.get("date")
+            or p.get("amount") in (None, 0) or not p.get("date") or bad_date
         if doubtful:
-            why = "перевод на свой счёт?" if p.get("internal_transfer") else (p.get("issue") or "не уверен")
+            why = "перевод на свой счёт?" if p.get("internal_transfer") else (bad_date or p.get("issue") or "не уверен")
             doubts.append((p, f"⚠️ {fmt(p)} — {why}\nНе записал. Если это расход {CATEGORY} — ответь на это сообщение «+»."))
             continue
         ok, info = await write(p, items)
@@ -347,6 +367,7 @@ async def handle_text(ev, group):
 def add_item(ev, group, item):
     key = (group, ev["source"].get("userId", "?"))
     item["msg_id"] = ev["message"]["id"]
+    item["ts"] = ev.get("timestamp")
     b = batches.setdefault(key, {"items": [], "task": None})
     b["items"].append(item)
     b["reply"] = ev.get("replyToken")  # ответим на последнее сообщение пачки
