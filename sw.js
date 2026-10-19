@@ -1,5 +1,5 @@
 // Network-first SW. Версию менять при каждом деплое.
-const CACHE='finances-v11-20261019';
+const CACHE='finances-v12-20261019';
 const ASSETS=['./','./index.html','./manifest.json'];
 
 self.addEventListener('install',e=>{

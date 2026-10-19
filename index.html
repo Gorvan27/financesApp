@@ -2212,7 +2212,11 @@ async function importFromSheets(silent){
     return;
    }
    const idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;
-   if(existing.has(idemKey))return;
+   if(existing.has(idemKey)){
+    // та же трата уже есть локально — подтянуть кошелёк, если у неё его нет
+    if(walletFromSheet){const tx1=S.txns.find(x=>(x.idemKey||`${x.type}|${x.amount}|${x.cat}|${x.date}|${x.cur}`)===idemKey&&!x.walletId);if(tx1){tx1.walletId=walletFromSheet;updated++;}}
+    return;
+   }
    if(tomb.has(idemKey))return;
    S.txns.unshift({id:rid||mid(),type,amount,cat,note,tags,date,cur,walletId:walletFromSheet,hasReceipt:false,photoUrl:photoUrl||'',createdAt:new Date().toISOString(),idemKey,synced:true});
    existing.add(idemKey);imported++;
