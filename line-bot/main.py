@@ -221,7 +221,9 @@ async def sheet_has(txid: str) -> bool:
         async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
             r = await c.get(SHEETS_URL)
             rows = (r.json() or {}).get("rows") or []
-        return any(len(x) > 9 and str(x[9]) == txid for x in rows)
+        # строка есть и не помечена удалённой (приложение удаляет мягко: status=deleted)
+        return any(len(x) > 9 and str(x[9]) == txid and str(x[10] if len(x) > 10 else "") != "deleted"
+                   for x in rows)
     except Exception as e:
         log.warning("sheet_has failed: %s", e)
         return False
@@ -382,8 +384,13 @@ def fmt(p: dict) -> str:
 
 async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[bool, str]:
     txid = p.get("_txid") or tx_id_for(p, items)
-    if p.get("ref") and db.execute("select 1 from seen where ref=?", (p["ref"],)).fetchone():
-        return False, "dup"
+    row = db.execute("select tx_id from seen where ref=?", (p["ref"],)).fetchone() if p.get("ref") else None
+    if row:
+        # «уже записано» — только если строка до сих пор в таблице; удалили → пишем заново
+        if DRY_RUN or not SHEETS_URL or await sheet_has(row[0]):
+            return False, "dup"
+        log.info("ref %s был удалён из таблицы — записываю заново", p["ref"])
+        db.execute("delete from seen where ref=?", (p["ref"],)); db.commit()
     if DRY_RUN:
         return True, txid
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
