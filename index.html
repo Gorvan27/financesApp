@@ -1525,7 +1525,7 @@ function screenHistory(){
    S.form={type:tx.type,amt:String(tx.amount),cat:tx.cat||tx.category,note:tx.note||'',tags:tx.tags||'',date:tx.date,cur:tx.cur||'THB',walletId:tx.walletId||'',receipt:null};
    S.editId=tx.id;S.screen='add';render();
   }},'✎'));
-  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{const k=tx.idemKey||(tx.type+'|'+tx.amount+'|'+(tx.cat||tx.category)+'|'+tx.date+'|'+(tx.cur||'THB'));S.tomb.unshift(k);if(S.tomb.length>500)S.tomb.length=500;if(tx.hasReceipt)deletePhoto(tx.id);if(S.sheetsUrl&&S.sheetsSync)S.outbox.push({action:'delete',id:tx.id,sig:[tx.date,tx.type,tx.amount,tx.cur||'THB',tx.note||''].join('|')});S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();flushOutbox();})},l.del);
+  const delBtn=el('button',{style:{background:'none',border:'none',color:'rgba(255,59,48,.5)',fontSize:'11px',cursor:'pointer',padding:'3px 0'},onClick:()=>confirm2(l.confDel,()=>{const k=tx.idemKey||(tx.type+'|'+tx.amount+'|'+(tx.cat||tx.category)+'|'+tx.date+'|'+(tx.cur||'THB'));S.tomb.unshift(k);if(tx.id)S.tomb.unshift('id:'+tx.id);if(S.tomb.length>500)S.tomb.length=500;if(tx.hasReceipt)deletePhoto(tx.id);if(S.sheetsUrl&&S.sheetsSync)S.outbox.push({action:'delete',id:tx.id,sig:[tx.date,tx.type,tx.amount,tx.cur||'THB',tx.note||''].join('|')});S.txns=S.txns.filter(x=>x.id!==tx.id);persist();render();flushOutbox();})},l.del);
   right.appendChild(delBtn);
   if(tx.hasReceipt||tx.receipt||tx.photoUrl){
    const vBtn=el('button',{style:{background:'none',border:'none',color:'rgba(0,122,255,.8)',fontSize:'10px',cursor:'pointer',display:'block',padding:'2px 0'},
@@ -2191,6 +2191,7 @@ async function importFromSheets(silent){
     if(rid&&byId.has(rid)){
      const tx0=byId.get(rid);
      if(tx0.hasReceipt)deletePhoto(tx0.id);
+     existing.delete(tx0.idemKey||`${tx0.type}|${tx0.amount}|${tx0.cat}|${tx0.date}|${tx0.cur}`);
      S.txns=S.txns.filter(x=>String(x.id)!==rid);byId.delete(rid);removed++;
     }
     return;
@@ -2212,13 +2213,14 @@ async function importFromSheets(silent){
     return;
    }
    const idemKey=`${type}|${amount}|${cat}|${date}|${cur}`;
+   if(rid&&(tomb.has('id:'+rid)||pend.has(rid)))return;
    if(existing.has(idemKey)){
     // та же трата уже есть локально — подтянуть кошелёк, если у неё его нет
     if(walletFromSheet){const tx1=S.txns.find(x=>(x.idemKey||`${x.type}|${x.amount}|${x.cat}|${x.date}|${x.cur}`)===idemKey&&!x.walletId);if(tx1){tx1.walletId=walletFromSheet;updated++;}}
     return;
    }
-   if(tomb.has(idemKey))return;
-   S.txns.unshift({id:rid||mid(),type,amount,cat,note,tags,date,cur,walletId:walletFromSheet,hasReceipt:false,photoUrl:photoUrl||'',createdAt:new Date().toISOString(),idemKey,synced:true});
+   if(!rid&&tomb.has(idemKey))return;
+   S.txns.unshift({id:rid||mid(),noSheetId:!rid,type,amount,cat,note,tags,date,cur,walletId:walletFromSheet,hasReceipt:false,photoUrl:photoUrl||'',createdAt:new Date().toISOString(),idemKey,synced:true});
    existing.add(idemKey);imported++;
   });
   // физически стёртые из таблицы строки → удалить локально (только синканные, и не ждущие в outbox)
@@ -2227,7 +2229,7 @@ async function importFromSheets(silent){
   const suspicious=syncedLocal>5&&sheetIds.size<syncedLocal*0.5;
   if(v2&&!suspicious){
    const before=S.txns.length;
-   S.txns=S.txns.filter(tx=>!(tx.id&&tx.synced&&!sheetIds.has(String(tx.id))&&!pend.has(String(tx.id))));
+   S.txns=S.txns.filter(tx=>!(tx.id&&tx.synced&&!tx.noSheetId&&!sheetIds.has(String(tx.id))&&!pend.has(String(tx.id))));
    removed+=before-S.txns.length;
   }
   S.txns.sort((a,b)=>new Date(b.date)-new Date(a.date)||new Date(b.createdAt)-new Date(a.createdAt));
