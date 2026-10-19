@@ -6,10 +6,10 @@ APP=dj-shop-accountant
 command -v fly >/dev/null || { echo "Ставлю flyctl..."; brew install flyctl; }
 fly auth whoami >/dev/null 2>&1 || fly auth login
 
-if ! fly apps list 2>/dev/null | grep -q "^$APP\b"; then
-  fly apps create "$APP"
-  fly volumes create shopbot_data --app "$APP" --region sin --size 1 --yes
-fi
+# создаём только если ещё нет (повторный запуск безопасен)
+fly status --app "$APP" >/dev/null 2>&1 || fly apps create "$APP"
+fly volumes list --app "$APP" 2>/dev/null | grep -q shopbot_data \
+  || fly volumes create shopbot_data --app "$APP" --region sin --size 1 --yes
 
 echo; echo "Вставь ключи (ввод скрыт, Enter после каждого):"
 read -rsp "1) LINE Channel secret: " LS; echo
