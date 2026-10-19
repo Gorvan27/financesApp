@@ -215,24 +215,34 @@ async def analyze(items: list) -> dict:
 
 
 # ════════ Google Sheets (тот же webhook, что у приложения) ════════
-async def sheet_has(txid: str) -> bool:
-    """Есть ли строка с этим id в таблице (doGet → rows, id в колонке 9)."""
+def _sheets_client(timeout):
+    # IPv4: с Fly к Google по IPv6 бывают зависания
+    return httpx.AsyncClient(timeout=timeout, follow_redirects=True,
+                             transport=httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=1))
+
+
+async def sheet_has(txid: str) -> bool | None:
+    """Есть ли строка с этим id в таблице. None — не удалось проверить (не путать с «нет»)."""
+    t0 = time.time()
     try:
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        async with _sheets_client(httpx.Timeout(90, connect=15)) as c:
             r = await c.get(SHEETS_URL)
             rows = (r.json() or {}).get("rows") or []
+        log.info("sheet_has %.1fs, %d rows", time.time() - t0, len(rows))
         # строка есть и не помечена удалённой (приложение удаляет мягко: status=deleted)
         return any(len(x) > 9 and str(x[9]) == txid and str(x[10] if len(x) > 10 else "") != "deleted"
                    for x in rows)
     except Exception as e:
-        log.warning("sheet_has failed: %s", e)
-        return False
+        log.warning("sheet_has failed after %.1fs: %r", time.time() - t0, e)
+        return None
 
 
 async def sheets_post(obj: dict) -> dict | None:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(240, connect=20), follow_redirects=True) as c:
+    t0 = time.time()
+    async with _sheets_client(httpx.Timeout(240, connect=20)) as c:
         r = await c.post(SHEETS_URL, content=json.dumps(obj),
                          headers={"Content-Type": "text/plain;charset=utf-8"})
+        log.info("sheets_post %s %.1fs", obj.get("action"), time.time() - t0)
         try:
             j = r.json()
             if not (isinstance(j, dict) and j.get("ok")):
@@ -387,7 +397,8 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     row = db.execute("select tx_id from seen where ref=?", (p["ref"],)).fetchone() if p.get("ref") else None
     if row:
         # «уже записано» — только если строка до сих пор в таблице; удалили → пишем заново
-        if DRY_RUN or not SHEETS_URL or await sheet_has(row[0]):
+        present = None if (DRY_RUN or not SHEETS_URL) else await sheet_has(row[0])
+        if present is not False:   # есть или не удалось проверить → не пишем повторно
             return False, "dup"
         log.info("ref %s был удалён из таблицы — записываю заново", p["ref"])
         db.execute("delete from seen where ref=?", (p["ref"],)); db.commit()
@@ -408,15 +419,18 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
         r = {"ok": False, "error": type(e).__name__}
     if not (r and r.get("ok")):
         # Таймаут ≠ провал: Apps Script мог дописать строку. Проверяем, прежде чем слать повторно.
-        if await sheet_has(txid):
+        has = await sheet_has(txid)
+        if has:
             r = {"ok": True}
+        elif has is None:
+            r = {"ok": False, "error": "sheet not responding — check the app before re-sending"}
         elif "photo" in tx:
             tx.pop("photo")
             try:
                 r2 = await sheets_post({"action": "add", "tx": tx})
             except Exception as e:
                 r2 = {"ok": False, "error": type(e).__name__}
-            if (r2 and r2.get("ok")) or await sheet_has(txid):
+            if (r2 and r2.get("ok")) or (await sheet_has(txid)) is True:
                 r = {"ok": True}; log.warning("saved without photo")
     if not (r and r.get("ok")):
         err = (r or {}).get("error") or (r or {}).get("message") or str(r)[:120]
