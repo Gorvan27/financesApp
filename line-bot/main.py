@@ -145,8 +145,7 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   ต.ค.=10 พ.ย.=11 ธ.ค.=12. Внимательно: ต.ค. — октябрь, ก.ค. — июль, พ.ค. — май.
   Дата оплаты — со слипа, не с чека.
 - ref — номер транзакции со слипа (เลขที่รายการ / หมายเลขอ้างอิง / Transaction ID).
-- description — коротко по-русски, ЗА ЧТО платили: из подписи человека (Wood → «Дерево»,
-  Water → «Вода») и/или из контекста («Дрель BOSCH, Shopee», «Доставка, Почта Таиланда»).
+- description — коротко НА АНГЛИЙСКОМ, ЗА ЧТО платили: из подписи человека (Wood → «Wood», Water → «Water») и/или из контекста («BOSCH drill, Shopee», «Delivery, Thailand Post»).
   Название банка или способа оплаты (PromptPay, KBIZ) — НЕ описание. Не выдумывай товар.
   Если ничего не известно — пустая строка.
 - context_indexes — номера вложений-контекста, которые относятся к этой оплате.
@@ -289,9 +288,9 @@ def date_suspicious(p: dict, items: list) -> str | None:
         return None
     sent = datetime.fromtimestamp(max(ts) / 1000, tz=timezone(timedelta(hours=7))).date()
     if d > sent + timedelta(days=1):
-        return "дата позже сообщения — проверь месяц"
+        return "date is after the message — check the month"
     if d < sent - timedelta(days=60):
-        return "дата старше 60 дней — проверь месяц"
+        return "date is older than 60 days — check the month"
     return None
 
 
@@ -302,14 +301,14 @@ def fmt(p: dict) -> str:
         d = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m")
     except Exception:
         pass
-    desc = p.get("description") or "без описания"
+    desc = p.get("description") or "no description"
     return f"{amt} ฿ · {desc} · {d}"
 
 
 async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[bool, str]:
     txid = tx_id_for(p, items)
     if p.get("ref") and db.execute("select 1 from seen where ref=?", (p["ref"],)).fetchone():
-        return False, "дубль"
+        return False, "dup"
     if DRY_RUN:
         return True, txid
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
@@ -320,7 +319,7 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
         tx["photo"] = ph
     r = await sheets_post({"action": "add", "tx": tx})
     if not (r and r.get("ok")):
-        return False, "ошибка записи в таблицу"
+        return False, "failed to write to the sheet"
     if p.get("ref"):
         db.execute("insert or ignore into seen values(?,?,?)", (p["ref"], txid, int(time.time())))
         db.commit()
@@ -340,7 +339,7 @@ async def process_batch(key):
         res = await analyze(items)
     except Exception as e:
         log.exception("analyze failed")
-        await line_push(group, f"⚠️ Не смог разобрать вложения ({type(e).__name__}). Внесите вручную.")
+        await line_push(group, f"⚠️ Could not read the attachments ({type(e).__name__}). Please add it manually.")
         return
     pays = res.get("payments") or []
     if not pays:
@@ -352,21 +351,21 @@ async def process_batch(key):
             or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
             or p.get("source") == "receipt_only"
         if doubtful:
-            why = ("перевод на свой счёт?" if p.get("internal_transfer")
-                   else "только чек, банковского слипа нет — наличные?" if p.get("source") == "receipt_only"
-                   else bad_date or p.get("issue") or "не уверен")
-            doubts.append((p, f"⚠️ {fmt(p)} — {why}\nНе записал. Если это расход {CATEGORY} — ответь на это сообщение «+»."))
+            why = ("transfer to own account?" if p.get("internal_transfer")
+                   else "receipt only, no bank slip — paid in cash?" if p.get("source") == "receipt_only"
+                   else bad_date or p.get("issue") or "not sure")
+            doubts.append((p, f"⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, reply \"+\" to this message."))
             continue
         ok, info = await write(p, items, pays)
         if ok:
-            lines.append(("📝 Записал бы: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
-        elif info == "дубль":
-            lines.append(f"↺ Уже записано: {fmt(p)}")
+            lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
+        elif info == "dup":
+            lines.append(f"↺ Already saved: {fmt(p)}")
         else:
             lines.append(f"⚠️ {fmt(p)} — {info}")
     texts = []
     if lines:
-        texts.append("\n".join(lines) + ("" if DRY_RUN or not written else "\n(ошибка? ответь на это сообщение «отмена»)"))
+        texts.append("\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message)"))
     texts += [t for _, t in doubts[:5 - len(texts)]]
     ids = await send_many(group, b.get("reply"), texts)
     off = 1 if lines else 0
@@ -399,27 +398,27 @@ def deserialize(items):
 async def handle_text(ev, group):
     text = ev["message"].get("text", "").strip().lower()
     quoted = ev["message"].get("quotedMessageId")
-    if quoted and text in ("+", "да", "yes", "ok", "расход", "ใช่"):
+    if quoted and text in ("+", "да", "yes", "y", "ok", "расход", "ใช่"):
         row = db.execute("select payload from pending where msg_id=?", (quoted,)).fetchone()
         if row:
             data = json.loads(row[0]); p = data["p"]; items = deserialize(data["items"])
             if p.get("amount") in (None, 0) or not p.get("date"):
-                await line_reply(ev["replyToken"], "Не хватает суммы или даты — внесите эту трату вручную.")
+                await line_reply(ev["replyToken"], "Amount or date is missing — please add this expense manually.")
                 return
             ok, info = await write(p, items)
             db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()
-            await line_reply(ev["replyToken"], ("📝 Записал бы: " if DRY_RUN else "✓ ") + fmt(p) if ok else f"⚠️ {info}")
+            await line_reply(ev["replyToken"], ("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p) if ok else f"⚠️ {info}")
             return
-    if quoted and text in ("отмена", "cancel", "x", "ยกเลิก") and not DRY_RUN:
+    if quoted and text in ("отмена", "cancel", "undo", "x", "ยกเลิก") and not DRY_RUN:
         row = db.execute("select tx_id from written where msg_id=?", (quoted,)).fetchone()
         if row:
             for txid in json.loads(row[0]):
                 await sheets_post({"action": "delete", "id": txid})
             db.execute("delete from written where msg_id=?", (quoted,)); db.commit()
-            await line_reply(ev["replyToken"], "✓ Отменил")
+            await line_reply(ev["replyToken"], "✓ Cancelled")
             return
-    if text in ("/id", "id группы"):
-        await line_reply(ev["replyToken"], f"ID группы: {group}")
+    if text in ("/id", "id группы", "group id"):
+        await line_reply(ev["replyToken"], f"Group ID: {group}")
         return
     add_item(ev, group, {"kind": "text", "text": ev["message"].get("text", "")[:500]})
 
@@ -440,7 +439,7 @@ async def handle_event(ev):
     src = ev.get("source", {})
     group = src.get("groupId") or src.get("roomId")
     if ev.get("type") == "join" and group:
-        await line_reply(ev["replyToken"], f"Привет! Я Shop Accountant 🧾 Записываю расходы DJ Shop из слипов и PDF.\nID группы: {group}")
+        await line_reply(ev["replyToken"], f"Hi! I'm Shop Accountant 🧾 I record DJ Shop expenses from bank slips and PDFs.\nGroup ID: {group}")
         return
     if ev.get("type") != "message" or not group:
         return

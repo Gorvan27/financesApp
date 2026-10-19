@@ -4,7 +4,7 @@ primary_region = "sin"
 [build]
 
 [env]
-  DRY_RUN = "1"
+  DRY_RUN = "0"
   CATEGORY = "DJ Shop"
   CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 
