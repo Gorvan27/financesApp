@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LINE_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_TOKEN", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5-5")
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 SHEETS_URL = os.environ.get("SHEETS_URL", "")
 GROUP_ID = os.environ.get("LINE_GROUP_ID", "")          # пусто → бот назовёт ID группы
 DRY_RUN = os.environ.get("DRY_RUN", "1") != "0"
