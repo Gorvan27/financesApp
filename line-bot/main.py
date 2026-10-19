@@ -164,6 +164,8 @@ TOOL = {
             "payments": {"type": "array", "items": {"type": "object", "properties": {
                 "amount": {"type": ["number", "null"]},
                 "date": {"type": ["string", "null"], "description": "YYYY-MM-DD, григорианский"},
+                "date_raw": {"type": ["string", "null"],
+                             "description": "дата ДОСЛОВНО как напечатана на слипе, тайскими буквами, напр. «19 ต.ค. 2569»"},
                 "ref": {"type": ["string", "null"]},
                 "bank": {"type": ["string", "null"]},
                 "payee": {"type": ["string", "null"]},
@@ -175,7 +177,7 @@ TOOL = {
                 "source": {"type": "string", "enum": ["bank_slip", "bank_pdf", "receipt_only"]},
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
-                            "image_index", "source", "context_indexes"]}},
+                            "image_index", "source", "context_indexes", "date_raw"]}},
             "ignored": {"type": "string", "description": "что из вложений не оплата и почему (коротко)"},
         },
         "required": ["payments"],
@@ -277,6 +279,52 @@ def photo_for(p: dict, items: list, all_pays: list | None = None) -> str | None:
     return "data:image/jpeg;base64," + base64.b64encode(collage(imgs)).decode()
 
 
+TH_MONTHS = [("ม.ค", "มกราคม", 1), ("ก.พ", "กุมภาพันธ์", 2), ("มี.ค", "มีนาคม", 3), ("เม.ย", "เมษายน", 4),
+             ("พ.ค", "พฤษภาคม", 5), ("มิ.ย", "มิถุนายน", 6), ("ก.ค", "กรกฎาคม", 7), ("ส.ค", "สิงหาคม", 8),
+             ("ก.ย", "กันยายน", 9), ("ต.ค", "ตุลาคม", 10), ("พ.ย", "พฤศจิกายน", 11), ("ธ.ค", "ธันวาคม", 12)]
+EN_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def parse_slip_date(raw: str | None) -> str | None:
+    """«19 ต.ค. 2569», «19 ต.ค. 69», «19 ตุลาคม 2569», «19 Oct 2026», «19/10/2026» → 2026-10-19."""
+    if not raw:
+        return None
+    t = raw.strip()
+    month = None
+    norm = t.replace(" ", "")
+    for abbr, full, n in TH_MONTHS:  # полные названия раньше сокращений
+        if full in norm:
+            month = n; break
+    if month is None:
+        nodots = norm.replace(".", "")
+        for abbr, full, n in TH_MONTHS:
+            if abbr.replace(".", "") in nodots:
+                month = n; break
+    if month is None:
+        m = re.search(r"[A-Za-z]{3}", t)
+        if m and m.group(0).lower() in EN_MONTHS:
+            month = EN_MONTHS[m.group(0).lower()]
+    nums = [int(x) for x in re.findall(r"\d+", t.split(":")[0] if ":" in t else t)]
+    if month is None:
+        m = re.search(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})", t)
+        if not m:
+            return None
+        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        if len(nums) < 2:
+            return None
+        day, year = nums[0], nums[1]
+    if year < 100:
+        year += 2500 if year >= 60 else 2000   # 69 → 2569 (BE)
+    if year > 2400:
+        year -= 543
+    try:
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def date_suspicious(p: dict, items: list) -> str | None:
     """Дата слипа не может быть позже сообщения и вряд ли старше 60 дней."""
     try:
@@ -346,6 +394,10 @@ async def process_batch(key):
         return
     lines, doubts, written = [], [], []
     for p in pays:
+        fixed = parse_slip_date(p.get("date_raw"))
+        if fixed and fixed != p.get("date"):
+            log.info("date fixed %s -> %s (raw %r)", p.get("date"), fixed, p.get("date_raw"))
+            p["date"] = fixed
         bad_date = date_suspicious(p, items)
         doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
             or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
@@ -398,6 +450,10 @@ def deserialize(items):
 async def handle_text(ev, group):
     text = ev["message"].get("text", "").strip().lower()
     quoted = ev["message"].get("quotedMessageId")
+    if not quoted and text in ("+", "yes", "да"):
+        last = db.execute("select msg_id from pending where ts>? order by ts desc limit 1",
+                          (int(time.time()) - 900,)).fetchone()
+        quoted = last[0] if last else None
     if quoted and text in ("+", "да", "yes", "y", "ok", "расход", "ใช่"):
         row = db.execute("select payload from pending where msg_id=?", (quoted,)).fetchone()
         if row:
