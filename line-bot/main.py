@@ -126,21 +126,34 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
 скрины заказов Shopee/Lazada/Alibaba/1688, переписки), PDF-инвойсы и текстовые подписи.
 
 Задача — найти ОПЛАТЫ и записать каждую как расход в THB.
-Правила:
-- Сумма берётся ТОЛЬКО со слипа об оплате или из PDF-инвойса/чека. Скрин заказа, корзины или
-  переписки — НЕ оплата, это пояснение к оплате рядом (сверяй по сумме, в т.ч. юани→бат в скобках).
-- Если есть и слип, и PDF/скрин на ту же сумму — это ОДНА оплата.
+
+ГЛАВНОЕ ПРАВИЛО: оплата = ТОЛЬКО банковский документ о переводе:
+  • слип банковского приложения (K PLUS, KBIZ, Krungsri, SCB, Bangkok Bank, PromptPay…):
+    есть отправитель → получатель, «จำนวนเงิน»/сумма и номер операции;
+  • PDF-выписка/подтверждение перевода из банка.
+  Сколько банковских слипов — столько оплат, не больше.
+ВСЁ ОСТАЛЬНОЕ — только КОНТЕКСТ, из него сумму НЕ брать никогда:
+  чеки магазинов и почты, кассовые ленты, скрины заказов Shopee/Lazada/1688, корзины,
+  накладные доставки, переписки, фото товара. Используй их, чтобы понять, ЗА ЧТО оплата:
+  сопоставь по сумме (например, чек почты ฿67+฿3=฿70 → объясняет слип на 70) и по смыслу.
+  Знак ฿ перед числом — это символ бата, а не цифра 8 («฿70» = 70, не 870).
+Если банковского слипа в пачке нет вовсе, но есть чек — верни одну запись с
+  source="receipt_only" (возможно, оплата наличными), сумму с чека, confidence="low".
+
 - Даты в тайском формате: «16 ต.ค. 69» / 2569 — это буддийский год, вычти 543 (69 → 2026).
   Тайские месяцы: ม.ค.=01 ก.พ.=02 มี.ค.=03 เม.ย.=04 พ.ค.=05 มิ.ย.=06 ก.ค.=07 ส.ค.=08 ก.ย.=09
   ต.ค.=10 พ.ย.=11 ธ.ค.=12. Внимательно: ต.ค. — октябрь, ก.ค. — июль, พ.ค. — май.
-- ref — номер транзакции со слипа (เลขที่รายการ / หมายเลขอ้างอิง / Order ID / Transaction ID).
-- description — коротко по-русски: подпись человека (Wood → «Дерево», Water → «Вода») и/или
-  что куплено, если видно на скрине заказа. Если ничего не известно — пустая строка.
-  Не выдумывай товар, если его не видно.
+  Дата оплаты — со слипа, не с чека.
+- ref — номер транзакции со слипа (เลขที่รายการ / หมายเลขอ้างอิง / Transaction ID).
+- description — коротко по-русски, ЗА ЧТО платили: из подписи человека (Wood → «Дерево»,
+  Water → «Вода») и/или из контекста («Дрель BOSCH, Shopee», «Доставка, Почта Таиланда»).
+  Название банка или способа оплаты (PromptPay, KBIZ) — НЕ описание. Не выдумывай товар.
+  Если ничего не известно — пустая строка.
+- context_indexes — номера вложений-контекста, которые относятся к этой оплате.
 - internal_transfer=true, если деньги переведены на собственный счёт отправителя/компании
   (тот же человек или та же компания с обеих сторон), это не расход.
-- confidence: high — сумма и дата чётко видны; low — что-то обрезано, размыто или неясно.
-- image_index — номер вложения (с 0), где лежит основной документ оплаты.
+- confidence: high — сумма и дата чётко видны на слипе; low — что-то обрезано, размыто или неясно.
+- image_index — номер вложения (с 0), где лежит банковский слип этой оплаты.
 Верни результат строго через инструмент record_payments."""
 
 TOOL = {
@@ -160,7 +173,10 @@ TOOL = {
                 "confidence": {"type": "string", "enum": ["high", "low"]},
                 "issue": {"type": ["string", "null"], "description": "что не так, если confidence=low"},
                 "image_index": {"type": "integer"},
-            }, "required": ["amount", "date", "description", "internal_transfer", "confidence", "image_index"]}},
+                "source": {"type": "string", "enum": ["bank_slip", "bank_pdf", "receipt_only"]},
+                "context_indexes": {"type": "array", "items": {"type": "integer"}},
+            }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
+                            "image_index", "source", "context_indexes"]}},
             "ignored": {"type": "string", "description": "что из вложений не оплата и почему (коротко)"},
         },
         "required": ["payments"],
@@ -214,11 +230,52 @@ def tx_id_for(p: dict, items: list) -> str:
     return "line_h" + h[:16]
 
 
-def photo_for(p: dict, items: list) -> str | None:
+def _img(it):
+    b = it.get("jpeg") or it.get("preview")
+    try:
+        return Image.open(io.BytesIO(b)).convert("RGB") if b else None
+    except Exception:
+        return None
+
+
+def collage(imgs: list, cell=700, max_bytes=900_000) -> bytes:
+    """Склейка: слип первым, затем контекст; 1–2 колонки, белый фон."""
+    thumbs = []
+    for im in imgs:
+        im = im.copy(); im.thumbnail((cell, int(cell * 1.8))); thumbs.append(im)
+    cols = 1 if len(thumbs) == 1 else 2
+    rows = [thumbs[i:i + cols] for i in range(0, len(thumbs), cols)]
+    pad = 12
+    W = cols * cell + (cols + 1) * pad
+    H = sum(max(t.height for t in r) for r in rows) + (len(rows) + 1) * pad
+    canvas = Image.new("RGB", (W, H), "white")
+    y = pad
+    for r in rows:
+        x = pad
+        for t in r:
+            canvas.paste(t, (x + (cell - t.width) // 2, y)); x += cell + pad
+        y += max(t.height for t in r) + pad
+    q = 82
+    while True:
+        out = io.BytesIO(); canvas.save(out, "JPEG", quality=q)
+        if out.tell() <= max_bytes or q <= 40:
+            return out.getvalue()
+        q -= 10
+
+
+def photo_for(p: dict, items: list, all_pays: list | None = None) -> str | None:
+    """Фото записи = слип оплаты + её контекст (чеки, заказы, переписка) одной картинкой."""
     idx = p.get("image_index", 0)
-    it = items[idx] if 0 <= idx < len(items) else None
-    jpeg = it and (it.get("jpeg") or it.get("preview"))
-    return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode() if jpeg else None
+    order = [idx] if 0 <= idx < len(items) else []
+    ctx = [i for i in (p.get("context_indexes") or []) if 0 <= i < len(items) and i != idx]
+    if not ctx:  # модель не связала — берём весь контекст пачки, кроме чужих слипов
+        slips = {q.get("image_index") for q in (all_pays or [])}
+        ctx = [i for i, it in enumerate(items) if i not in slips and i != idx
+               and it.get("kind") in ("image", "pdf")]
+    imgs = [im for im in (_img(items[i]) for i in order + ctx) if im]
+    if not imgs:
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(collage(imgs)).decode()
 
 
 def date_suspicious(p: dict, items: list) -> str | None:
@@ -249,7 +306,7 @@ def fmt(p: dict) -> str:
     return f"{amt} ฿ · {desc} · {d}"
 
 
-async def write(p: dict, items: list) -> tuple[bool, str]:
+async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[bool, str]:
     txid = tx_id_for(p, items)
     if p.get("ref") and db.execute("select 1 from seen where ref=?", (p["ref"],)).fetchone():
         return False, "дубль"
@@ -258,7 +315,7 @@ async def write(p: dict, items: list) -> tuple[bool, str]:
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
           "note": p.get("description") or "", "tags": "line", "date": p["date"], "cur": "THB",
           "walletId": "", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": True}
-    ph = photo_for(p, items)
+    ph = photo_for(p, items, all_pays)
     if ph:
         tx["photo"] = ph
     r = await sheets_post({"action": "add", "tx": tx})
@@ -292,12 +349,15 @@ async def process_batch(key):
     for p in pays:
         bad_date = date_suspicious(p, items)
         doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
-            or p.get("amount") in (None, 0) or not p.get("date") or bad_date
+            or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
+            or p.get("source") == "receipt_only"
         if doubtful:
-            why = "перевод на свой счёт?" if p.get("internal_transfer") else (bad_date or p.get("issue") or "не уверен")
+            why = ("перевод на свой счёт?" if p.get("internal_transfer")
+                   else "только чек, банковского слипа нет — наличные?" if p.get("source") == "receipt_only"
+                   else bad_date or p.get("issue") or "не уверен")
             doubts.append((p, f"⚠️ {fmt(p)} — {why}\nНе записал. Если это расход {CATEGORY} — ответь на это сообщение «+»."))
             continue
-        ok, info = await write(p, items)
+        ok, info = await write(p, items, pays)
         if ok:
             lines.append(("📝 Записал бы: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
         elif info == "дубль":
