@@ -574,6 +574,14 @@ async def process_batch(key):
         recent_text.pop(key, None)
     chunks = chunk_units(split_units(all_items), MAX_ATT_PER_CALL)
     log.info("batch: %d items → %d calls", len(all_items), len(chunks))
+    n_att = sum(i["kind"] in ("image", "pdf") for i in all_items)
+    if len(chunks) > 1 and b.get("reply"):
+        # большая пачка идёт минуты — сразу говорим, что приняли (reply бесплатный), итог придёт push'ем
+        try:
+            await line_reply(b["reply"], f"⏳ Got {n_att} images — processing, the summary will follow in a few minutes.")
+            b["reply"] = None
+        except Exception:
+            log.warning("ack failed")
     lines, doubts, written = [], [], []
     for items in chunks:
         if not any(i["kind"] in ("image", "pdf") for i in items):
