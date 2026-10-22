@@ -2112,7 +2112,7 @@ function screenSettings(){
   el('button',{style:{flex:'1',background:'rgba(0,122,255,.15)',border:'.5px solid rgba(0,122,255,.3)',borderRadius:'10px',padding:'9px',color:'#007AFF',fontSize:'13px',fontWeight:'600'},
    onClick:testSheets},'🔌 '+l.shTest),
   el('button',{style:{flex:'1',background:'rgba(52,199,89,.15)',border:'.5px solid rgba(52,199,89,.3)',borderRadius:'10px',padding:'9px',color:'#34C759',fontSize:'13px',fontWeight:'600'},
-   onClick:importFromSheets},'⬇️ '+(l.importSheets||'Import'))
+   onClick:()=>importFromSheets(false)},'⬇️ '+(l.importSheets||'Import'))
  ));
  // Sync all — дозалить весь локальный список в таблицу (бэклог). Дубли отсеет doPost.
  shR.appendChild(el('div',{style:{display:'flex',marginTop:'8px'}},
@@ -2163,8 +2163,8 @@ function splitWalletTag(tags){const s=String(tags||'');const m=s.match(/wallet:(
 async function importFromSheets(silent){
  const l=t();
  if(!S.sheetsUrl){if(!silent)toast(l.shNot,true);return;}
- if(_pulling)return;_pulling=true;
- if(!silent)toast('Syncing with Sheets...');
+ if(_pulling){if(!silent)toast('Sync already running… try again in a few seconds');return;}_pulling=true;
+ if(!silent)toast('⏳ Importing from Sheets…');
  try{
   const res=await fetch(S.sheetsUrl,{method:'GET'});
   const data=await res.json();

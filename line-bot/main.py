@@ -402,6 +402,8 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
             return False, "dup"
         log.info("ref %s был удалён из таблицы — записываю заново", p["ref"])
         db.execute("delete from seen where ref=?", (p["ref"],)); db.commit()
+        # новый id: приложение помнит удалённый id и не стало бы показывать запись с тем же номером
+        txid = f"{txid}_r{int(time.time()) % 1000000}"
     if DRY_RUN:
         return True, txid
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
