@@ -128,6 +128,7 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
 скрины заказов Shopee/Lazada/Alibaba/1688, переписки), PDF-инвойсы и текстовые подписи.
 
 Задача — найти ОПЛАТЫ и записать каждую как расход в THB.
+Подпись ([подпись]) относится к вложению(ям), которые идут НЕПОСРЕДСТВЕННО ПЕРЕД ней.
 
 ГЛАВНОЕ ПРАВИЛО: оплата = ТОЛЬКО банковский документ о переводе:
   • слип банковского приложения (K PLUS, KBIZ, Krungsri, SCB, Bangkok Bank, PromptPay…):
@@ -204,7 +205,7 @@ async def analyze(items: list) -> dict:
     async with httpx.AsyncClient(timeout=120) as c:
         r = await c.post("https://api.anthropic.com/v1/messages",
                          headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01"},
-                         json={"model": CLAUDE_MODEL, "max_tokens": 2000, "system": SYSTEM,
+                         json={"model": CLAUDE_MODEL, "max_tokens": 4000, "system": SYSTEM,
                                "tools": [TOOL], "tool_choice": {"type": "tool", "name": "record_payments"},
                                "messages": [{"role": "user", "content": content}]})
         r.raise_for_status()
@@ -505,62 +506,119 @@ async def process_cash_notes(group, items, reply_token):
 
 
 # ════════ обработка пачки ════════
+MAX_ATT_PER_CALL = int(os.environ.get("MAX_ATT_PER_CALL", "5"))
+
+
+def split_units(items: list) -> list:
+    """Пачка → смысловые блоки: «вложения + подпись после них». Новый блок начинается
+    с вложения, если у текущего уже есть и вложение, и подпись. Слип + скрин заказа + подпись = один блок."""
+    units, cur, has_att, has_txt = [], [], False, False
+    for it in items:
+        is_att = it["kind"] in ("image", "pdf")
+        if is_att and has_att and has_txt:
+            units.append(cur); cur, has_att, has_txt = [], False, False
+        cur.append(it)
+        has_att |= is_att
+        has_txt |= not is_att
+    if cur:
+        units.append(cur)
+    return units
+
+
+def chunk_units(units: list, limit: int) -> list:
+    """Блоки → вызовы модели по ≤limit вложений; блок не режется (кроме блока больше лимита)."""
+    chunks, cur, n = [], [], 0
+    for u in units:
+        k = sum(i["kind"] in ("image", "pdf") for i in u)
+        if k > limit:   # 19 картинок без подписей — режем по limit
+            if cur:
+                chunks.append(cur); cur, n = [], 0
+            part, m = [], 0
+            for it in u:
+                if it["kind"] in ("image", "pdf") and m == limit:
+                    chunks.append(part); part, m = [], 0
+                part.append(it); m += it["kind"] in ("image", "pdf")
+            if part:
+                chunks.append(part)
+            continue
+        if cur and n + k > limit:
+            chunks.append(cur); cur, n = [], 0
+        cur += u; n += k
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
 async def process_batch(key):
     await asyncio.sleep(BATCH_WAIT)
     b = batches.pop(key, None)
     if not b:
         return
-    group, items = key[0], b["items"]
-    if not any(i["kind"] in ("image", "pdf") for i in items):
+    group, all_items = key[0], b["items"]
+    if not any(i["kind"] in ("image", "pdf") for i in all_items):
         # без вложений: пишем только явные записи наличными («Wood 1200 cash»), остальное — переписка
-        await process_cash_notes(group, items, b.get("reply"))
+        await process_cash_notes(group, all_items, b.get("reply"))
         return
-    try:
-        res = await analyze(items)
-    except Exception as e:
-        log.exception("analyze failed")
-        await line_push(group, f"⚠️ Could not read the attachments ({type(e).__name__}). Please add it manually.")
-        return
-    pays = res.get("payments") or []
-    if not pays:
-        return
+    chunks = chunk_units(split_units(all_items), MAX_ATT_PER_CALL)
+    log.info("batch: %d items → %d calls", len(all_items), len(chunks))
     lines, doubts, written = [], [], []
-    for p in pays:
-        p["ref"] = clean_ref(p.get("ref"))
-        fixed = parse_slip_date(p.get("date_raw"))
-        if fixed and fixed != p.get("date"):
-            log.info("date fixed %s -> %s (raw %r)", p.get("date"), fixed, p.get("date_raw"))
-            p["date"] = fixed
-        bad_date = date_suspicious(p, items)
-        doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
-            or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
-            or p.get("source") == "receipt_only"
-        if doubtful:
-            why = ("transfer to own account?" if p.get("internal_transfer")
-                   else "receipt only, no bank slip — paid in cash?" if p.get("source") == "receipt_only"
-                   else bad_date or p.get("issue") or "not sure")
-            doubts.append((p, f"⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, reply \"+\" to this message."))
+    for items in chunks:
+        if not any(i["kind"] in ("image", "pdf") for i in items):
             continue
         try:
-            ok, info = await write(p, items, pays)
-        except Exception as e:  # никогда не молчим: любая ошибка записи — сообщение в группу
-            log.exception("write failed")
-            ok, info = False, f"error {type(e).__name__}"
-        if ok:
-            lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
-        elif info == "dup":
-            lines.append(f"↺ Already saved: {fmt(p)}")
-        else:
-            lines.append(f"⚠️ {fmt(p)} — {info}")
+            res = await analyze(items)
+        except Exception as e:
+            log.exception("analyze failed")
+            lines.append(f"⚠️ Could not read {sum(i['kind'] in ('image','pdf') for i in items)} attachment(s) "
+                         f"({type(e).__name__}). Please re-send them.")
+            continue
+        pays = res.get("payments") or []
+        for p in pays:
+            p["ref"] = clean_ref(p.get("ref"))
+            fixed = parse_slip_date(p.get("date_raw"))
+            if fixed and fixed != p.get("date"):
+                log.info("date fixed %s -> %s (raw %r)", p.get("date"), fixed, p.get("date_raw"))
+                p["date"] = fixed
+            bad_date = date_suspicious(p, items)
+            doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
+                or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
+                or p.get("source") == "receipt_only"
+            if doubtful:
+                why = ("transfer to own account?" if p.get("internal_transfer")
+                       else "receipt only, no bank slip — paid in cash?" if p.get("source") == "receipt_only"
+                       else bad_date or p.get("issue") or "not sure")
+                doubts.append((p, items, f"⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, reply \"+\" to this message."))
+                continue
+            try:
+                ok, info = await write(p, items, pays)
+            except Exception as e:  # никогда не молчим: любая ошибка записи — сообщение в группу
+                log.exception("write failed")
+                ok, info = False, f"error {type(e).__name__}"
+            if ok:
+                lines.append(("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p)); written.append(info)
+            elif info == "dup":
+                lines.append(f"↺ Already saved: {fmt(p)}")
+            else:
+                lines.append(f"⚠️ {fmt(p)} — {info}")
+    if not lines and not doubts:
+        return
     texts = []
     if lines:
-        texts.append("\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message)"))
-    texts += [t for _, t in doubts[:5 - len(texts)]]
+        total = sum(1 for l in lines if l.startswith("✓"))
+        head = f"{total} saved:\n" if total > 1 else ""
+        texts.append(head + "\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message — cancels all lines above)"))
+    room = 5 - len(texts)
+    shown = doubts[:room] if len(doubts) <= room else doubts[:room - 1]
+    texts += [t for _, _, t in shown]
+    if len(doubts) > len(shown):
+        rest = doubts[len(shown):]
+        texts.append(f"⚠️ {len(rest)} more unclear: " + "; ".join(fmt(p) for p, _, _ in rest)
+                     + "\nNot saved — re-send these slips one by one.")
     ids = await send_many(group, b.get("reply"), texts)
     off = 1 if lines else 0
     if lines and ids and written and not DRY_RUN:
         db.execute("insert or replace into written values(?,?,?)", (ids[0], json.dumps(written), int(time.time())))
-    for (p, _), mid in zip(doubts, ids[off:]):
+    for (p, items, _), mid in zip(shown, ids[off:]):
         if mid:
             db.execute("insert or replace into pending values(?,?,?)",
                        (mid, json.dumps({"p": p, "items": serialize(items)}), int(time.time())))
