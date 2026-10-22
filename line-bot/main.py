@@ -129,6 +129,8 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
 
 Задача — найти ОПЛАТЫ и записать каждую как расход в THB.
 Подпись ([подпись]) относится к вложению(ям), которые идут НЕПОСРЕДСТВЕННО ПЕРЕД ней.
+Если подпись стоит в самом начале, до всех вложений (или помечена «написана до картинки»), —
+она относится к следующему за ней вложению.
 
 ГЛАВНОЕ ПРАВИЛО: оплата = ТОЛЬКО банковский документ о переводе:
   • слип банковского приложения (K PLUS, KBIZ, Krungsri, SCB, Bangkok Bank, PromptPay…):
@@ -497,15 +499,19 @@ async def process_cash_notes(group, items, reply_token):
             else:
                 lines.append(f"⚠️ {fmt(p)} — {info}")
     if not lines:
-        return
+        return False
     text = "\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message)")
     ids = await send_many(group, reply_token, [text])
     if ids and written and not DRY_RUN:
         db.execute("insert or replace into written values(?,?,?)", (ids[0], json.dumps(written), int(time.time())))
         db.commit()
+    return True
 
 
 # ════════ обработка пачки ════════
+# Текст без картинки, пришедший раньше (>40 с до слипа): держим 5 минут как возможную подпись
+recent_text: dict = {}
+CAPTION_LOOKBACK = 300
 MAX_ATT_PER_CALL = int(os.environ.get("MAX_ATT_PER_CALL", "5"))
 
 
@@ -557,8 +563,15 @@ async def process_batch(key):
     group, all_items = key[0], b["items"]
     if not any(i["kind"] in ("image", "pdf") for i in all_items):
         # без вложений: пишем только явные записи наличными («Wood 1200 cash»), остальное — переписка
-        await process_cash_notes(group, all_items, b.get("reply"))
+        if not await process_cash_notes(group, all_items, b.get("reply")):
+            recent_text[key] = (time.time(), [i for i in all_items if i["kind"] == "text"])
         return
+    if not any(i["kind"] == "text" for i in all_items) and key in recent_text:
+        t0, txts = recent_text.pop(key)
+        if time.time() - t0 <= CAPTION_LOOKBACK and txts:
+            all_items = [{**txts[-1], "text": txts[-1].get("text", "") + " (написана до картинки)"}] + all_items
+    else:
+        recent_text.pop(key, None)
     chunks = chunk_units(split_units(all_items), MAX_ATT_PER_CALL)
     log.info("batch: %d items → %d calls", len(all_items), len(chunks))
     lines, doubts, written = [], [], []
