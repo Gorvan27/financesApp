@@ -2535,6 +2535,8 @@ function screenAdd(){
 
 // ── SYNC v2: POST c читаемым ответом (text/plain = simple request, без preflight) ──
 async function sheetsPost(obj){
+ // «-150thb …», «+…», «=…» Google Sheets считает формулой → #ERROR!. Апостроф делает текстом и не виден
+ if(obj&&obj.tx&&typeof obj.tx.note==='string'&&/^[=+\-@]/.test(obj.tx.note))obj={...obj,tx:{...obj.tx,note:"'"+obj.tx.note}};
  if(obj&&obj.tx&&obj.tx.walletId&&!/wallet:/.test(obj.tx.tags||'')){const tg=String(obj.tx.tags||'').trim();obj={...obj,tx:{...obj.tx,tags:(tg?tg+',':'')+'wallet:'+obj.tx.walletId}};}
  // Пользовательские категории уходят в таблицу названием: ID у каждого телефона свой
  if(obj&&obj.tx&&obj.tx.cat){const c=S.custom.find(x=>x.id===obj.tx.cat);if(c&&c.label)obj={...obj,tx:{...obj.tx,cat:c.label}};}

@@ -412,7 +412,8 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     if DRY_RUN:
         return True, txid
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
-          "note": p.get("description") or "", "date": p["date"], "cur": "THB",
+          "note": ("'" if re.match(r"[=+\-@]", p.get("description") or "") else "") + (p.get("description") or ""),
+          "date": p["date"], "cur": "THB",
           "tags": "line,wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
     ph = photo_for(p, items, all_pays)
     if ph:
