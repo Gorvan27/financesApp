@@ -135,7 +135,9 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
 ГЛАВНОЕ ПРАВИЛО: оплата = ТОЛЬКО банковский документ о переводе:
   • слип банковского приложения (K PLUS, KBIZ, Krungsri, SCB, Bangkok Bank, PromptPay…):
     есть отправитель → получатель, «จำนวนเงิน»/сумма и номер операции;
-  • PDF-выписка/подтверждение перевода из банка.
+  • PDF-документ (подтверждение перевода, e-slip банка, оплаченный инвойс/чек/ใบเสร็จ/ใบกำกับภาษี):
+    сумма к оплате/итог (ยอดรวม / Total / Grand total) — это оплата, source="bank_pdf".
+    Если в той же пачке есть слип на ту же сумму — это одна оплата, не две.
   Сколько банковских слипов — столько оплат, не больше.
 ВСЁ ОСТАЛЬНОЕ — только КОНТЕКСТ, из него сумму НЕ брать никогда:
   чеки магазинов и почты, кассовые ленты, скрины заказов Shopee/Lazada/1688, корзины,
@@ -594,6 +596,11 @@ async def process_batch(key):
                          f"({type(e).__name__}). Please re-send them.")
             continue
         pays = res.get("payments") or []
+        if not pays:
+            names = ", ".join(i.get("name") or "image" for i in items if i["kind"] in ("image", "pdf"))
+            lines.append(f"ℹ️ No payment found in: {names[:120]}"
+                         + (f" — {res.get('ignored')[:160]}" if res.get("ignored") else "")
+                         + ". If it is an expense, send the bank slip or add it manually.")
         for p in pays:
             p["ref"] = clean_ref(p.get("ref"))
             fixed = parse_slip_date(p.get("date_raw"))
@@ -673,6 +680,7 @@ async def handle_text(ev, group):
     if quoted and text in ("+", "да", "yes", "y", "ok", "расход", "ใช่"):
         row = db.execute("select payload from pending where msg_id=?", (quoted,)).fetchone()
         if row:
+            db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()  # забрали — второй «+» не запишет
             data = json.loads(row[0]); p = data["p"]; items = deserialize(data["items"])
             if p.get("amount") in (None, 0) or not p.get("date"):
                 await line_reply(ev["replyToken"], "Amount or date is missing — please add this expense manually.")
@@ -727,8 +735,13 @@ async def handle_event(ev):
             raw = await line_content(m["id"])  # файлы в LINE истекают — качаем сразу
             add_item(ev, group, {"kind": "pdf", "raw": raw, "name": m.get("fileName"),
                                  "preview": pdf_first_page_jpeg(raw)})
-    except Exception:
+    except Exception as e:
         log.exception("event failed")
+        if t in ("image", "file") and ev.get("replyToken"):
+            try:
+                await line_reply(ev["replyToken"], f"⚠️ Could not download this {t} ({type(e).__name__}). Please re-send it.")
+            except Exception:
+                pass
 
 
 @app.post("/callback")
