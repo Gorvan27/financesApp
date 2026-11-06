@@ -76,7 +76,13 @@ async def line_push(to: str, text: str, quote: str | None = None) -> str | None:
 
 async def send_many(group: str, reply_token: str | None, texts: list) -> list:
     """До 5 сообщений одним вызовом. Сначала reply (бесплатно), если токен истёк — push."""
-    msgs = [{"type": "text", "text": t[:4900]} for t in texts[:5]]
+    msgs = []
+    for t in texts[:5]:
+        text, qt = (t if isinstance(t, tuple) else (t, None))
+        m = {"type": "text", "text": text[:4900]}
+        if qt:
+            m["quoteToken"] = qt   # ответ «цитатой» на исходную картинку/сообщение
+        msgs.append(m)
     async with httpx.AsyncClient(timeout=30) as c:
         r = None
         if reply_token:
@@ -84,6 +90,13 @@ async def send_many(group: str, reply_token: str | None, texts: list) -> list:
                              headers={"Authorization": f"Bearer {LINE_TOKEN}"},
                              json={"replyToken": reply_token, "messages": msgs})
         if not r or r.status_code != 200:
+            r = await c.post("https://api.line.me/v2/bot/message/push",
+                             headers={"Authorization": f"Bearer {LINE_TOKEN}"},
+                             json={"to": group, "messages": msgs})
+        if r.status_code != 200 and any("quoteToken" in m for m in msgs):
+            log.warning("send with quote failed %s %s — retry without quotes", r.status_code, r.text[:200])
+            for m in msgs:
+                m.pop("quoteToken", None)
             r = await c.post("https://api.line.me/v2/bot/message/push",
                              headers={"Authorization": f"Bearer {LINE_TOKEN}"},
                              json={"to": group, "messages": msgs})
@@ -138,6 +151,10 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   • PDF-документ (подтверждение перевода, e-slip банка, оплаченный инвойс/чек/ใบเสร็จ/ใบกำกับภาษี):
     сумма к оплате/итог (ยอดรวม / Total / Grand total) — это оплата, source="bank_pdf".
     Если в той же пачке есть слип на ту же сумму — это одна оплата, не две.
+  ОДИН документ (один PDF/счёт/выписка) = НЕ БОЛЬШЕ ОДНОЙ оплаты: итог именно этого счёта.
+  Таблицы истории прошлых счетов, «предыдущие платежи», графики рассрочки, прошлые месяцы
+  внутри счёта — это НЕ оплаты, не выписывай их отдельными строками.
+  Дата для счёта — дата выставления/оплаты этого счёта, НЕ срок оплаты (due date) в будущем.
   Сколько банковских слипов — столько оплат, не больше.
 ВСЁ ОСТАЛЬНОЕ — только КОНТЕКСТ, из него сумму НЕ брать никогда:
   чеки магазинов и почты, кассовые ленты, скрины заказов Shopee/Lazada/1688, корзины,
@@ -616,7 +633,10 @@ async def process_batch(key):
                 why = ("transfer to own account?" if p.get("internal_transfer")
                        else "receipt only, no bank slip — paid in cash?" if p.get("source") == "receipt_only"
                        else bad_date or p.get("issue") or "not sure")
-                doubts.append((p, items, f"⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, reply \"+\" to this message."))
+                src = items[p["image_index"]] if 0 <= (p.get("image_index") or 0) < len(items) else {}
+                label = f"📎 {src.get('name')}\n" if src.get("name") else ""
+                doubts.append((p, items, (f"{label}⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, "
+                                          f"reply \"+\" to THIS message.", src.get("qt"))))
                 continue
             try:
                 ok, info = await write(p, items, pays)
@@ -638,7 +658,7 @@ async def process_batch(key):
         texts.append(head + "\n".join(lines) + ("" if DRY_RUN or not written else "\n(mistake? reply \"cancel\" to this message — cancels all lines above)"))
     room = 5 - len(texts)
     shown = doubts[:room] if len(doubts) <= room else doubts[:room - 1]
-    texts += [t for _, _, t in shown]
+    texts += [t for _, _, t in shown]  # (текст, quoteToken)
     if len(doubts) > len(shown):
         rest = doubts[len(shown):]
         texts.append(f"⚠️ {len(rest)} more unclear: " + "; ".join(fmt(p) for p, _, _ in rest)
@@ -708,6 +728,7 @@ def add_item(ev, group, item):
     key = (group, ev["source"].get("userId", "?"))
     item["msg_id"] = ev["message"]["id"]
     item["ts"] = ev.get("timestamp")
+    item["qt"] = ev["message"].get("quoteToken")  # LINE даёт его для текста/картинок, не для файлов
     b = batches.setdefault(key, {"items": [], "task": None})
     b["items"].append(item)
     b["reply"] = ev.get("replyToken")  # ответим на последнее сообщение пачки
