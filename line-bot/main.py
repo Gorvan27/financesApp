@@ -7,7 +7,7 @@ Shop Accountant — LINE-бот учёта расходов DJ Shop.
 
 Режим DRY_RUN=1 (по умолчанию): бот только отвечает «записал бы», в таблицу не пишет.
 """
-import asyncio, base64, hashlib, hmac, io, json, logging, os, re, sqlite3, time
+import asyncio, base64, hashlib, hmac, io, json, logging, os, re, sqlite3, time, uuid
 from datetime import datetime, timezone, timedelta
 
 import httpx
@@ -669,7 +669,7 @@ async def process_batch(key):
                 src = items[p["image_index"]] if 0 <= (p.get("image_index") or 0) < len(items) else {}
                 label = f"📎 {src.get('name')}\n" if src.get("name") else ""
                 doubts.append((p, items, (f"{label}⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, "
-                                          f"reply \"+\" to THIS message.", src.get("qt"))))
+                                          f"reply \"+\" to THIS message (\"-\" to skip). Missed it? Send \"pending\".", src.get("qt"))))
                 continue
             try:
                 ok, info = await write(p, items, pays)
@@ -695,15 +695,48 @@ async def process_batch(key):
     if len(doubts) > len(shown):
         rest = doubts[len(shown):]
         texts.append(f"⚠️ {len(rest)} more unclear: " + "; ".join(fmt(p) for p, _, _ in rest)
-                     + "\nNot saved — re-send these slips one by one.")
+                     + "\nNot saved yet — send \"pending\" to review them one by one.")
     ids = await send_many(group, b.get("reply"), texts)
     off = 1 if lines else 0
     if lines and ids and written and not DRY_RUN:
         db.execute("insert or replace into written values(?,?,?)", (ids[0], json.dumps(written), int(time.time())))
-    for (p, items, _), mid in zip(shown, ids[off:]):
+    for (p, items, t), mid in zip(shown, ids[off:]):
         if mid:
             db.execute("insert or replace into pending values(?,?,?)",
-                       (mid, json.dumps({"p": p, "items": serialize(items)}), int(time.time())))
+                       (mid, json.dumps({"p": p, "items": serialize(items), "qt": t[1]}), int(time.time())))
+    for p, items, t in doubts[len(shown):]:  # не влезли в 5 сообщений — тоже ждут решения, команда «pending»
+        db.execute("insert or replace into pending values(?,?,?)",
+                   (f"later-{uuid.uuid4().hex}", json.dumps({"p": p, "items": serialize(items), "qt": t[1]}),
+                    int(time.time())))
+    db.commit()
+
+
+def msg_date(items: list) -> str | None:
+    ts = [i.get("ts") for i in items if i.get("ts")]
+    if not ts:
+        return None
+    return datetime.fromtimestamp(max(ts) / 1000, tz=timezone(timedelta(hours=7))).strftime("%Y-%m-%d")
+
+
+async def show_pending(ev, group):
+    """Команда «pending»: заново показывает несогласованные траты, по одной, на каждую можно ответить «+» или «-»."""
+    cutoff = int(time.time()) - 45 * 86400
+    db.execute("delete from pending where ts<?", (cutoff,)); db.commit()
+    rows = db.execute("select msg_id, payload from pending order by ts asc").fetchall()
+    if not rows:
+        await line_reply(ev["replyToken"], "✓ Nothing waiting — all unclear expenses are handled.")
+        return
+    batch = rows[:4]
+    texts = [f"📋 {len(rows)} expense(s) waiting for a decision. Reply \"+\" to save, \"-\" to skip."
+             + (f" Showing the oldest {len(batch)}; send \"pending\" again for the rest." if len(rows) > len(batch) else "")]
+    for _, payload in batch:
+        d = json.loads(payload)
+        texts.append((f"⏳ {fmt(d['p'])}\nReply \"+\" to save or \"-\" to skip.", d.get("qt")))
+    ids = await send_many(group, ev["replyToken"], texts)
+    for (old_id, payload), mid in zip(batch, ids[1:]):
+        if mid:  # перевешиваем на новое сообщение — «+» / «-» отвечают уже на него
+            db.execute("delete from pending where msg_id=?", (old_id,))
+            db.execute("insert or replace into pending values(?,?,?)", (mid, payload, int(time.time())))
     db.commit()
 
 
@@ -736,13 +769,25 @@ async def handle_text(ev, group):
         if row:
             db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()  # забрали — второй «+» не запишет
             data = json.loads(row[0]); p = data["p"]; items = deserialize(data["items"])
+            note = ""
+            if not p.get("date") and p.get("amount") not in (None, 0):
+                p["date"] = msg_date(items)
+                note = "\n(date not on the screenshot — used the date it was sent; fix in the app if needed)"
             if p.get("amount") in (None, 0) or not p.get("date"):
-                await line_reply(ev["replyToken"], "Amount or date is missing — please add this expense manually.")
+                await line_reply(ev["replyToken"], "Amount is missing — please add this expense manually.")
                 return
             ok, info = await write(p, items)
             db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()
-            await line_reply(ev["replyToken"], ("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p) if ok else f"⚠️ {info}")
+            await line_reply(ev["replyToken"], (("📝 Would save: " if DRY_RUN else "✓ ") + fmt(p) + note) if ok else f"⚠️ {info}")
             return
+    if quoted and text in ("-", "skip", "no", "нет", "ไม่"):
+        if db.execute("select 1 from pending where msg_id=?", (quoted,)).fetchone():
+            db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()
+            await line_reply(ev["replyToken"], "✓ Skipped — not saved.")
+            return
+    if text in ("pending", "/pending", "unclear", "list", "รอ", "ค้าง", "несогласованные"):
+        await show_pending(ev, group)
+        return
     if quoted and text in ("отмена", "cancel", "undo", "x", "ยกเลิก") and not DRY_RUN:
         row = db.execute("select tx_id from written where msg_id=?", (quoted,)).fetchone()
         if row:
