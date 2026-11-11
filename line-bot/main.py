@@ -161,8 +161,18 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   payment_status="failed". Оплачено — «ชำระแล้ว», «Paid», «สำเร็จ» → "paid". У банковского
   слипа без такой надписи → "paid". Неудачные попытки Meta часто идут сериями на одну сумму —
   это НЕ расходы.
+  • ОПЛАЧЕННЫЙ ЗАКАЗ маркетплейса (Alibaba / 1688 / Shopee / Lazada / Temu), когда слипа нет:
+    страница ЗАКАЗА со статусом оплаты: «Paid», «已付款», «待发货», «待收货», «已发货»,
+    «交易成功», «ชำระเงินแล้ว», «ที่ต้องจัดส่ง», «กำลังจัดส่ง», «สำเร็จ» и т.п. →
+    source="order_paid", amount = итог заказа (Total / 实付款 / 合计 / ยอดชำระ),
+    currency = валюта этого итога как на экране (THB, CNY, USD…), ref = номер заказа
+    (订单号 / Order No. / หมายเลขคำสั่งซื้อ), date = дата оплаты заказа, description — что купили.
+    Несколько скринов ОДНОГО заказа = одна оплата. Несколько разных заказов = отдельные оплаты.
+    НЕ оплата: корзина (购物车 / Cart / รถเข็น), каталог, карточка товара, «待付款»,
+    «Awaiting payment», «Unpaid», «รอชำระเงิน» — это только контекст.
+    Если в пачке есть банковский слип на этот заказ — оплата одна, source="bank_slip".
 ВСЁ ОСТАЛЬНОЕ — только КОНТЕКСТ, из него сумму НЕ брать никогда:
-  чеки магазинов и почты, кассовые ленты, скрины заказов Shopee/Lazada/1688, корзины,
+  чеки магазинов и почты, кассовые ленты, корзины и неоплаченные заказы,
   накладные доставки, переписки, фото товара. Используй их, чтобы понять, ЗА ЧТО оплата:
   сопоставь по сумме (например, чек почты ฿67+฿3=฿70 → объясняет слип на 70) и по смыслу.
   Знак ฿ перед числом — это символ бата, а не цифра 8 («฿70» = 70, не 870).
@@ -204,7 +214,8 @@ TOOL = {
                 "confidence": {"type": "string", "enum": ["high", "low"]},
                 "issue": {"type": ["string", "null"], "description": "что не так, если confidence=low"},
                 "image_index": {"type": "integer"},
-                "source": {"type": "string", "enum": ["bank_slip", "bank_pdf", "receipt_only"]},
+                "source": {"type": "string", "enum": ["bank_slip", "bank_pdf", "receipt_only", "order_paid"]},
+                "currency": {"type": "string", "description": "валюта суммы как на документе: THB, CNY, USD…"},
                 "payment_status": {"type": "string", "enum": ["paid", "failed", "unknown"]},
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
@@ -640,6 +651,14 @@ async def process_batch(key):
                 log.info("date fixed %s -> %s (raw %r)", p.get("date"), fixed, p.get("date_raw"))
                 p["date"] = fixed
             bad_date = date_suspicious(p, items)
+            cur = (p.get("currency") or "THB").upper().strip()
+            foreign = cur not in ("THB", "฿", "BAHT", "บาท")
+            if p.get("source") == "order_paid" and not foreign:
+                p["description"] = ((p.get("description") or "").strip() + " (order paid, no slip)").strip()
+            if foreign:  # сумма не в батах — не пишем и не предлагаем «+», курс не выдумываем
+                lines.append(f"ℹ️ Paid order {p.get('amount')} {cur} · {p.get('description') or ''} — total is not in THB. "
+                             "Send the bank slip or add the THB amount manually.")
+                continue
             doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
                 or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
                 or p.get("source") == "receipt_only"
