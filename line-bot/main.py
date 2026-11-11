@@ -156,6 +156,11 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   внутри счёта — это НЕ оплаты, не выписывай их отдельными строками.
   Дата для счёта — дата выставления/оплаты этого счёта, НЕ срок оплаты (due date) в будущем.
   Сколько банковских слипов — столько оплат, не больше.
+  СТАТУС ПЛАТЕЖА: у квитанций Meta/Facebook и других сервисов есть статус. «ไม่สำเร็จ»,
+  «Failed», «Declined», «Unsuccessful», «ล้มเหลว» = платёж НЕ ПРОШЁЛ, деньги не списаны →
+  payment_status="failed". Оплачено — «ชำระแล้ว», «Paid», «สำเร็จ» → "paid". У банковского
+  слипа без такой надписи → "paid". Неудачные попытки Meta часто идут сериями на одну сумму —
+  это НЕ расходы.
 ВСЁ ОСТАЛЬНОЕ — только КОНТЕКСТ, из него сумму НЕ брать никогда:
   чеки магазинов и почты, кассовые ленты, скрины заказов Shopee/Lazada/1688, корзины,
   накладные доставки, переписки, фото товара. Используй их, чтобы понять, ЗА ЧТО оплата:
@@ -200,9 +205,10 @@ TOOL = {
                 "issue": {"type": ["string", "null"], "description": "что не так, если confidence=low"},
                 "image_index": {"type": "integer"},
                 "source": {"type": "string", "enum": ["bank_slip", "bank_pdf", "receipt_only"]},
+                "payment_status": {"type": "string", "enum": ["paid", "failed", "unknown"]},
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
-                            "image_index", "source", "context_indexes", "date_raw"]}},
+                            "image_index", "source", "context_indexes", "date_raw", "payment_status"]}},
             "ignored": {"type": "string", "description": "что из вложений не оплата и почему (коротко)"},
         },
         "required": ["payments"],
@@ -620,6 +626,9 @@ async def process_batch(key):
                          + (f" — {res.get('ignored')[:160]}" if res.get("ignored") else "")
                          + ". If it is an expense, send the bank slip or add it manually.")
         for p in pays:
+            if p.get("payment_status") == "failed":  # неудачная попытка списания — не расход
+                lines.append(f"✗ Payment FAILED on the receipt, not saved: {fmt(p)}")
+                continue
             p["ref"] = clean_ref(p.get("ref"))
             fixed = parse_slip_date(p.get("date_raw"))
             if fixed and fixed != p.get("date"):
