@@ -711,6 +711,45 @@ async def process_batch(key):
     db.commit()
 
 
+async def sheet_rows() -> list | None:
+    try:
+        async with _sheets_client(httpx.Timeout(90, connect=15)) as c:
+            r = await c.get(SHEETS_URL)
+            return (r.json() or {}).get("rows") or []
+    except Exception as e:
+        log.warning("sheet_rows failed: %r", e)
+        return None
+
+
+def already_in_sheet(rows: list | None, p: dict) -> str | None:
+    """Есть ли в таблице живой расход на ту же сумму (±0.01) в пределах 45 дней от даты траты."""
+    if not rows or p.get("amount") in (None, 0):
+        return None
+    try:
+        d0 = datetime.strptime(p.get("date") or "", "%Y-%m-%d").date()
+    except Exception:
+        d0 = None
+    for x in rows:
+        if len(x) < 3 or str(x[1]) != "expense" or (len(x) > 10 and str(x[10]) == "deleted"):
+            continue
+        try:
+            a = float(str(x[2]).replace(",", ".").replace(" ", ""))
+        except Exception:
+            continue
+        if abs(a - float(p["amount"])) > 0.01:
+            continue
+        ds = str(x[0])[:10]
+        try:
+            d1 = datetime.strptime(ds, "%Y-%m-%d").date()
+            if d0 and abs((d1 - d0).days) > 45:
+                continue
+            ds = d1.strftime("%d.%m")
+        except Exception:
+            pass
+        return f"{ds} · {x[5] if len(x) > 5 else ''}".strip(" ·")
+    return None
+
+
 def msg_date(items: list) -> str | None:
     ts = [i.get("ts") for i in items if i.get("ts")]
     if not ts:
@@ -727,11 +766,26 @@ async def show_pending(ev, group):
         await line_reply(ev["replyToken"], "✓ Nothing waiting — all unclear expenses are handled.")
         return
     batch = rows[:4]
+    sheet = await sheet_rows()
     texts = [f"📋 {len(rows)} expense(s) waiting for a decision. Reply \"+\" to save, \"-\" to skip."
              + (f" Showing the oldest {len(batch)}; send \"pending\" again for the rest." if len(rows) > len(batch) else "")]
     for _, payload in batch:
-        d = json.loads(payload)
-        texts.append((f"⏳ {fmt(d['p'])}\nReply \"+\" to save or \"-\" to skip.", d.get("qt")))
+        d = json.loads(payload); p = d["p"]
+        fixed = parse_slip_date(p.get("date_raw"))
+        if fixed:
+            p["date"] = fixed
+        qt = d.get("qt") or next((i.get("qt") for i in d.get("items", []) if i.get("qt")), None)
+        sent = msg_date(d.get("items", []))
+        sent_s = datetime.strptime(sent, "%Y-%m-%d").strftime("%d.%m") if sent else "?"
+        names = ", ".join(i.get("name") for i in d.get("items", []) if i.get("name"))
+        txt = f"⏳ {fmt(p)}\nSent to the group on {sent_s}" + (f" · 📎 {names[:80]}" if names else "") \
+              + ("" if qt else " (original message: scroll to that date)")
+        dup = already_in_sheet(sheet, p)
+        if dup:
+            txt += f"\n⚠️ Looks ALREADY SAVED: {dup} — most likely re-sent later. Reply \"-\"."
+        else:
+            txt += "\nNot in the table yet."
+        texts.append((txt + "\nReply \"+\" to save or \"-\" to skip.", qt))
     ids = await send_many(group, ev["replyToken"], texts)
     for (old_id, payload), mid in zip(batch, ids[1:]):
         if mid:  # перевешиваем на новое сообщение — «+» / «-» отвечают уже на него
