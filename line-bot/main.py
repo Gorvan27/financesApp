@@ -209,11 +209,16 @@ TOOL = {
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
                             "image_index", "source", "context_indexes", "date_raw", "payment_status"]}},
-            "ignored": {"type": "string", "description": "что из вложений не оплата и почему (коротко)"},
+            "ignored": {"type": "string", "description": "IN ENGLISH, one short sentence (max 15 words): what the attachments are and why it is not a payment"},
         },
         "required": ["payments"],
     },
 }
+
+
+def short(t: str, n: int = 140) -> str:
+    t = " ".join((t or "").split())
+    return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + "…"
 
 
 async def analyze(items: list) -> dict:
@@ -623,7 +628,7 @@ async def process_batch(key):
         if not pays:
             names = ", ".join(i.get("name") or "image" for i in items if i["kind"] in ("image", "pdf"))
             lines.append(f"ℹ️ No payment found in: {names[:120]}"
-                         + (f" — {res.get('ignored')[:160]}" if res.get("ignored") else "")
+                         + (f" — {short(res.get('ignored'))}" if res.get("ignored") else "")
                          + ". If it is an expense, send the bank slip or add it manually.")
         for p in pays:
             if p.get("payment_status") == "failed":  # неудачная попытка списания — не расход
