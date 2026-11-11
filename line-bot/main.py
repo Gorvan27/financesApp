@@ -721,14 +721,16 @@ async def sheet_rows() -> list | None:
         return None
 
 
-def already_in_sheet(rows: list | None, p: dict) -> str | None:
+def already_in_sheet(rows: list | None, p: dict, sent: str | None = None) -> str | None:
     """Есть ли в таблице живой расход на ту же сумму (±0.01) в пределах 45 дней от даты траты."""
     if not rows or p.get("amount") in (None, 0):
         return None
-    try:
-        d0 = datetime.strptime(p.get("date") or "", "%Y-%m-%d").date()
-    except Exception:
-        d0 = None
+    anchors = []
+    for v in (p.get("date"), sent):  # дата траты может быть кривой (старый баг месяцев) — сверяем и с датой отправки
+        try:
+            anchors.append(datetime.strptime(v or "", "%Y-%m-%d").date())
+        except Exception:
+            pass
     for x in rows:
         if len(x) < 3 or str(x[1]) != "expense" or (len(x) > 10 and str(x[10]) == "deleted"):
             continue
@@ -741,7 +743,7 @@ def already_in_sheet(rows: list | None, p: dict) -> str | None:
         ds = str(x[0])[:10]
         try:
             d1 = datetime.strptime(ds, "%Y-%m-%d").date()
-            if d0 and abs((d1 - d0).days) > 45:
+            if anchors and min(abs((d1 - a).days) for a in anchors) > 45:
                 continue
             ds = d1.strftime("%d.%m")
         except Exception:
@@ -780,7 +782,7 @@ async def show_pending(ev, group):
         names = ", ".join(i.get("name") for i in d.get("items", []) if i.get("name"))
         txt = f"⏳ {fmt(p)}\nSent to the group on {sent_s}" + (f" · 📎 {names[:80]}" if names else "") \
               + ("" if qt else " (original message: scroll to that date)")
-        dup = already_in_sheet(sheet, p)
+        dup = already_in_sheet(sheet, p, sent)
         if dup:
             txt += f"\n⚠️ Looks ALREADY SAVED: {dup} — most likely re-sent later. Reply \"-\"."
         else:
