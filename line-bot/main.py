@@ -669,7 +669,7 @@ async def process_batch(key):
                 src = items[p["image_index"]] if 0 <= (p.get("image_index") or 0) < len(items) else {}
                 label = f"📎 {src.get('name')}\n" if src.get("name") else ""
                 doubts.append((p, items, (f"{label}⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, "
-                                          f"reply \"+\" to THIS message (\"-\" to skip). Missed it? Send \"pending\".", src.get("qt"))))
+                                          f"reply \"+\" to THIS message (\"-\" to skip). Missed it? Send \"#check\".", src.get("qt"))))
                 continue
             try:
                 ok, info = await write(p, items, pays)
@@ -695,7 +695,7 @@ async def process_batch(key):
     if len(doubts) > len(shown):
         rest = doubts[len(shown):]
         texts.append(f"⚠️ {len(rest)} more unclear: " + "; ".join(fmt(p) for p, _, _ in rest)
-                     + "\nNot saved yet — send \"pending\" to review them one by one.")
+                     + "\nNot saved yet — send \"#check\" to review them one by one.")
     ids = await send_many(group, b.get("reply"), texts)
     off = 1 if lines else 0
     if lines and ids and written and not DRY_RUN:
@@ -770,7 +770,7 @@ async def show_pending(ev, group):
     batch = rows[:4]
     sheet = await sheet_rows()
     texts = [f"📋 {len(rows)} expense(s) waiting for a decision. Reply \"+\" to save, \"-\" to skip."
-             + (f" Showing the oldest {len(batch)}; send \"pending\" again for the rest." if len(rows) > len(batch) else "")]
+             + (f" Showing the oldest {len(batch)}; send \"#check\" again for the rest." if len(rows) > len(batch) else "")]
     for _, payload in batch:
         d = json.loads(payload); p = d["p"]
         fixed = parse_slip_date(p.get("date_raw"))
@@ -841,7 +841,7 @@ async def handle_text(ev, group):
             db.execute("delete from pending where msg_id=?", (quoted,)); db.commit()
             await line_reply(ev["replyToken"], "✓ Skipped — not saved.")
             return
-    if text in ("pending", "/pending", "unclear", "list", "รอ", "ค้าง", "несогласованные"):
+    if text.replace(" ", "") in ("#check", "check", "#чек", "pending", "/pending", "unclear", "list", "รอ", "ค้าง", "несогласованные"):
         await show_pending(ev, group)
         return
     if quoted and text in ("отмена", "cancel", "undo", "x", "ยกเลิก") and not DRY_RUN:
