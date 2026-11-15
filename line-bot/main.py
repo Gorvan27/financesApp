@@ -424,6 +424,35 @@ def date_suspicious(p: dict, items: list) -> str | None:
     return None
 
 
+def repair_date(p: dict, items: list) -> str | None:
+    """Месяц на слипе часто путается (พ.ค ↔ พ.ย, ม.ค ↔ มี.ค). Берём день со слипа и ближайший
+    месяц не позже даты сообщения; если не выходит — дату сообщения. Возвращает исходную дату для пометки."""
+    ts = [i.get("ts") for i in items if i.get("ts")]
+    if not ts:
+        return None
+    sent = datetime.fromtimestamp(max(ts) / 1000, tz=timezone(timedelta(hours=7))).date()
+    orig = p.get("date")
+    try:
+        day = datetime.strptime(orig or "", "%Y-%m-%d").day
+    except Exception:
+        day = None
+    new = None
+    if day:
+        y, m = sent.year, sent.month
+        for _ in range(2):  # этот месяц или прошлый
+            try:
+                c = sent.replace(year=y, month=m, day=day)
+            except ValueError:
+                c = None
+            if c and sent - timedelta(days=40) <= c <= sent + timedelta(days=1):
+                new = c; break
+            m -= 1
+            if m == 0:
+                y, m = y - 1, 12
+    p["date"] = (new or sent).isoformat()
+    return orig
+
+
 def fmt(p: dict) -> str:
     amt = f"{p['amount']:,.2f}".replace(",", " ") if p.get("amount") is not None else "?"
     d = p.get("date") or "?"
@@ -453,7 +482,7 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
           "note": ("'" if re.match(r"[=+\-@]", p.get("description") or "") else "") + (p.get("description") or ""),
           "date": p["date"], "cur": "THB",
-          "tags": "line,wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
+          "tags": "line," + ("check," if p.get("_check") else "") + "wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
     ph = photo_for(p, items, all_pays)
     if ph:
         tx["photo"] = ph
@@ -659,13 +688,28 @@ async def process_batch(key):
                 lines.append(f"ℹ️ Paid order {p.get('amount')} {cur} · {p.get('description') or ''} — total is not in THB. "
                              "Send the bank slip or add the THB amount manually.")
                 continue
-            doubtful = p.get("internal_transfer") or p.get("confidence") != "high" \
-                or p.get("amount") in (None, 0) or not p.get("date") or bad_date \
-                or p.get("source") == "receipt_only"
+            check = None
+            if bad_date or not p.get("date"):
+                orig = repair_date(p, items)
+                d_s = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d.%m")
+                check = f"date on slip unclear ({orig or '?'}), set {d_s}"
+            elif p.get("internal_transfer"):
+                check = "transfer to own account?"
+            elif p.get("source") == "receipt_only":
+                check = "receipt only, no bank slip — cash?"
+            elif p.get("confidence") != "high":
+                check = p.get("issue") or "not sure"
+            if p.get("amount") not in (None, 0) and p.get("date"):
+                if not (p.get("description") or "").strip():
+                    p["description"] = CATEGORY
+                if check:  # не спрашиваем «+»: пишем сразу, но с пометкой — видно в приложении и в печати
+                    p["description"] = f"⚠️ CHECK: {check} · {p['description']}"
+                    p["_check"] = True
+            doubtful = p.get("amount") in (None, 0) or not p.get("date")
             if doubtful:
                 why = ("transfer to own account?" if p.get("internal_transfer")
                        else "receipt only, no bank slip — paid in cash?" if p.get("source") == "receipt_only"
-                       else bad_date or p.get("issue") or "not sure")
+                       else "amount is missing" if p.get("amount") in (None, 0) else bad_date or p.get("issue") or "not sure")
                 src = items[p["image_index"]] if 0 <= (p.get("image_index") or 0) < len(items) else {}
                 label = f"📎 {src.get('name')}\n" if src.get("name") else ""
                 doubts.append((p, items, (f"{label}⚠️ {fmt(p)} — {why}\nNot saved. If this is a {CATEGORY} expense, "
