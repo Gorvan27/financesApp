@@ -161,6 +161,14 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   payment_status="failed". Оплачено — «ชำระแล้ว», «Paid», «สำเร็จ» → "paid". У банковского
   слипа без такой надписи → "paid". Неудачные попытки Meta часто идут сериями на одну сумму —
   это НЕ расходы.
+  • SMS / push-уведомление банка о списании (напр. «16/11/69 01:34 บช X-7341 เงินออก 701.89
+    คงเหลือ 2,029.84 บ.») — это оплата, source="bank_slip". amount = сумма после «เงินออก»,
+    «ถอน», «โอนออก», «ชำระ», «จ่าย», «Withdrawal», «Debit», «Paid». Число после «คงเหลือ»,
+    «ยอดคงเหลือ», «Balance», «Avail», «Bal» — ОСТАТОК на счёте, НИКОГДА не сумма; запиши его
+    в balance. «เงินเข้า» / «รับโอน» / «Deposit» — поступление, не расход. Дата — из начала SMS
+    (дд/мм/гг буддийского года), ref = null. Если в пачке есть счёт/заказ в валюте (USD…) и SMS
+    со списанием в батах на ту же покупку — оплата ОДНА: amount из SMS в THB, currency="THB",
+    description — что оплачено по счёту (напр. «Railway hosting»).
   • ОПЛАЧЕННЫЙ ЗАКАЗ маркетплейса (Alibaba / 1688 / Shopee / Lazada / Temu), когда слипа нет:
     страница ЗАКАЗА со статусом оплаты: «Paid», «已付款», «待发货», «待收货», «已发货»,
     «交易成功», «ชำระเงินแล้ว», «ที่ต้องจัดส่ง», «กำลังจัดส่ง», «สำเร็จ» и т.п. →
@@ -218,6 +226,7 @@ TOOL = {
                 "currency": {"type": "string", "description": "валюта суммы как на документе: THB, CNY, USD…"},
                 "payment_status": {"type": "string", "enum": ["paid", "failed", "unknown"]},
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
+                "balance": {"type": ["number", "null"], "description": "остаток на счёте, если он напечатан (คงเหลือ / Balance); не сумма оплаты"},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
                             "image_index", "source", "context_indexes", "date_raw", "payment_status"]}},
             "ignored": {"type": "string", "description": "IN ENGLISH, one short sentence (max 15 words): what the attachments are and why it is not a payment"},
@@ -693,6 +702,9 @@ async def process_batch(key):
                 orig = repair_date(p, items)
                 d_s = datetime.strptime(p["date"], "%Y-%m-%d").strftime("%d.%m")
                 check = f"date on slip unclear ({orig or '?'}), set {d_s}"
+            elif p.get("balance") is not None and p.get("amount") is not None \
+                    and abs(float(p["balance"]) - float(p["amount"])) < 0.01:
+                check = "amount equals the account BALANCE shown — real charge may differ"
             elif p.get("internal_transfer"):
                 check = "transfer to own account?"
             elif p.get("source") == "receipt_only":
