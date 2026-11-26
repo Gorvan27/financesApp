@@ -197,6 +197,11 @@ SYSTEM = f"""Ты бухгалтер магазина DJ Shop (Паттайя, �
   Название банка или способа оплаты (PromptPay, KBIZ) — НЕ описание. Не выдумывай товар.
   Если ничего не известно — пустая строка.
 - context_indexes — номера вложений-контекста, которые относятся к этой оплате.
+- ВОЗВРАТ КЛИЕНТУ — это ОПЛАТА, записывай её (не в ignored!): слип перевода частному лицу, а в
+  подписи или переписке «คืนเงิน», «โอนคืน», «ส่งผิด», «ลูกค้าโอนเกิน», «refund», «возврат»,
+  «ยกเลิกออเดอร์» и т.п. → refund=true, source="bank_slip", amount со слипа,
+  description по-английски: «Refund to customer <имя получателя> — <причина: paid by mistake /
+  overpaid / order cancelled>». Скрин чата с клиентом — контекст, не отдельная оплата.
 - internal_transfer=true, если деньги переведены на собственный счёт отправителя/компании
   (тот же человек или та же компания с обеих сторон), это не расход.
 - confidence: high — сумма и дата чётко видны на слипе; low — что-то обрезано, размыто или неясно.
@@ -226,6 +231,7 @@ TOOL = {
                 "currency": {"type": "string", "description": "валюта суммы как на документе: THB, CNY, USD…"},
                 "payment_status": {"type": "string", "enum": ["paid", "failed", "unknown"]},
                 "context_indexes": {"type": "array", "items": {"type": "integer"}},
+                "refund": {"type": "boolean", "description": "true — деньги возвращены клиенту"},
                 "balance": {"type": ["number", "null"], "description": "остаток на счёте, если он напечатан (คงเหลือ / Balance); не сумма оплаты"},
             }, "required": ["amount", "date", "description", "internal_transfer", "confidence",
                             "image_index", "source", "context_indexes", "date_raw", "payment_status"]}},
@@ -491,7 +497,7 @@ async def write(p: dict, items: list, all_pays: list | None = None) -> tuple[boo
     tx = {"id": txid, "type": "expense", "amount": round(float(p["amount"]), 2), "cat": CATEGORY,
           "note": ("'" if re.match(r"[=+\-@]", p.get("description") or "") else "") + (p.get("description") or ""),
           "date": p["date"], "cur": "THB",
-          "tags": "line," + ("check," if p.get("_check") else "") + "wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
+          "tags": "line," + ("check," if p.get("_check") else "") + ("refund," if p.get("refund") else "") + "wallet:" + (p.get("wallet") or "w_card"), "walletId": p.get("wallet") or "w_card", "createdAt": datetime.now(timezone.utc).isoformat(), "hasReceipt": bool(items)}
     ph = photo_for(p, items, all_pays)
     if ph:
         tx["photo"] = ph
@@ -697,6 +703,10 @@ async def process_batch(key):
                 lines.append(f"ℹ️ Paid order {p.get('amount')} {cur} · {p.get('description') or ''} — total is not in THB. "
                              "Send the bank slip or add the THB amount manually.")
                 continue
+            if p.get("refund"):
+                d0 = (p.get("description") or "").strip()
+                p["description"] = d0 if d0.lower().startswith("refund") else ("Refund to customer — " + d0).strip(" —")
+                p["description"] = "↩️ " + p["description"]
             check = None
             if bad_date or not p.get("date"):
                 orig = repair_date(p, items)
